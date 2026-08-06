@@ -1,0 +1,161 @@
+================================================================================
+CTF WRITE-UP / WALKTHROUGH
+Byte Lotus Hotel - Covert Communication Channel (Keylogger Exfiltration)
+File analyzed : traffic.pcapng
+Flag          : THM{V3r4_1s_w4tch1ng_0veR_y0u}
+================================================================================
+
+THE STORY / CHALLENGE SETUP
+---------------------------
+A hotel guest laptop (192.168.1.141) is running a "quiet little errand on a
+loop". Tiny, suspiciously regular HTTP requests go out every second to a
+server (34.41.103.191:8080 / byte-lotus-hotel.thm:8080). Each request looks
+harmless, but hidden inside a cookie there is one exfiltrated keystroke.
+
+A keylogger was dropped onto the machine from /temp/updates.py. It captures
+every keypress, encrypts each single character, and ships it out inside an
+HTTP request -- one request per keystroke.
+
+================================================================================
+PART A - STEP-BY-STEP WITH WIRESHARK (GUI)
+================================================================================
+
+STEP 1 - OPEN THE CAPTURE
+  * Start Wireshark and open traffic.pcapng (File > Open).
+
+STEP 2 - GET AN OVERVIEW
+  * Statistics > Protocol Hierarchy.
+    You will see normal traffic (DNS, QUIC, TLS, SSDP) plus a chunk of
+    plaintext HTTP. Plain HTTP is unusual for a hotel guest network.
+
+STEP 3 - SPOT THE SUSPICIOUS HTTP TRAFFIC
+  * Type this in the display filter bar and press Enter:
+        http
+  * Look at the results. You see:
+        - One GET /temp/updates.py from a normal Chrome browser.
+        - Many GET / requests whose User-Agent is "ByteLotusClient/1.1".
+    "ByteLotusClient" is not a real product -- this is the giveaway that the
+    requests are not coming from a genuine application.
+
+STEP 4 - EXAMINE THE DROPPER / IMPLANT
+  * Find the packet with  GET /temp/updates.py  (the very first HTTP request).
+  * Right-click it > Follow > TCP Stream.
+  * You now see the attacker's Python script. Key facts to write down:
+        - C2_URL          = http://byte-lotus-hotel.thm:8080/
+        - Encryption key  = "H0t3lSt@ff0Nly" + "K3epS3cr3t!"
+          -> full key string = H0t3lSt@ff0NlyK3epS3cr3t!
+        - Each keystroke is XOR-encrypted with this key, then base64-encoded.
+        - The result is placed in the HTTP header:
+              Cookie: hotel_sess_state=<base64>
+        - The request is sent with User-Agent:
+              Mozilla/5.0 (Windows NT 10.0; Win64; x64) ByteLotusClient/1.1
+    This is a keylogger: every key press produces one tiny HTTP GET.
+
+STEP 5 - ISOLATE THE EXFILTRATION TRAFFIC
+  * Replace the filter with:
+        http.cookie contains "hotel_sess_state"
+    (or:  http.user_agent contains "ByteLotusClient")
+  * Now you only see the exfiltration requests. Sort by the "No." column
+    (chronological order) if needed.
+
+STEP 6 - EXTRACT THE COOKIE VALUES IN ORDER
+  * Easiest way to collect the payloads:
+    1) Right-click the column header row > "Column Preferences".
+    2) Click "+" to add a column:  Title = "cookie",  Fields = "http.cookie".
+    3) Apply. Now every row shows its cookie value.
+    4) Click the "No." column to sort by frame number (oldest first).
+    5) Read off the hotel_sess_state=... values from top to bottom.
+  * You should get 30 values, e.g.:
+        HA==  AA==  BQ==  Mw==  Hg==  ew==  Og==  fA==  Fw==  eQ==
+        Ow==  Fw==  Pw==  fA==  PA==  Kw==  IA==  eQ==  Jg==  Lw==
+        Fw==  eA==  Pg==  LQ==  Gg==  Fw==  MQ==  eA==  PQ==  NQ==
+
+STEP 7 - DECRYPT THE KEYSTROKES
+  * Each cookie value is base64( XOR( char, key ) ).
+  * Decode + decrypt in order and concatenate. See the decoder script in
+    Part C. Result:  THM{V3r4_1s_w4tch1ng_0veR_y0u}
+
+================================================================================
+PART B - ALTERNATIVE: COMMAND LINE (TSHARK) ROUTE
+================================================================================
+
+# 1. See all HTTP requests and the interesting endpoints:
+    tshark -r traffic.pcapng -Y "http" \
+      -T fields -e frame.number -e http.request.uri -e http.user_agent
+
+# 2. Read the keylogger script (TCP stream 5):
+    tshark -r traffic.pcapng -q -z follow,tcp,ascii,5
+
+# 3. Dump the exfiltrated cookies in frame order:
+    tshark -r traffic.pcapng -Y "http.cookie" \
+      -T fields -e frame.number -e http.cookie | grep hotel_sess_state
+
+# 4. Feed the values into the decoder (Part C).
+
+================================================================================
+PART C - DECODER SCRIPT
+================================================================================
+
+  #!/usr/bin/env python3
+  import base64
+
+  key = b"H0t3lSt@ff0NlyK3epS3cr3t!"            # XOR key from updates.py
+
+  cookies = [
+      "HA==","AA==","BQ==","Mw==","Hg==","ew==","Og==","fA==","Fw==","eQ==",
+      "Ow==","Fw==","Pw==","fA==","PA==","Kw==","IA==","eQ==","Jg==","Lw==",
+      "Fw==","eA==","Pg==","LQ==","Gg==","Fw==","MQ==","eA==","PQ==","NQ==",
+  ]
+
+  plaintext = ""
+  for c in cookies:
+      raw = base64.b64decode(c)                      # base64 -> encrypted byte(s)
+      dec = bytes(b ^ key[i % len(key)] for i, b in enumerate(raw))  # XOR decode
+      plaintext += dec.decode("utf-8")
+
+  print("FLAG:", plaintext)
+
+================================================================================
+PART D - FULL WALKTHROUGH / EXPLANATION (THE "WHY")
+================================================================================
+
+1. FINDING THE CHANNEL
+   The scenario hints at "tiny packets", "odd hours", "suspiciously regular".
+   In the capture this maps exactly to a GET request fired roughly every
+   second to 34.41.103.191:8080. Normal browsing (DNS, QUIC, TLS) exists too,
+   but the one thing that is mechanical and repetitive is this HTTP beacon.
+
+2. WHY THE USER-AGENT MATTERS
+   A real client identifies itself with a recognizable User-Agent. The string
+   "ByteLotusClient/1.1" is fabricated, so these GET / requests are a scripted
+   agent, not a browser. That is the first big red flag.
+
+3. FOLLOWING THE TRAIL
+   The very first HTTP request is a Chrome browser downloading
+   /temp/updates.py -- the "update" the attacker planted. Following that TCP
+   stream reveals the implant source code. It turns out to be a keylogger:
+   it encrypts each key press and exfiltrates it one character at a time.
+
+4. UNDERSTANDING THE OBFUSCATION
+   - Encoding: each character is base64-encoded so it can live in a Cookie
+     header value (Cookie values are restricted to printable characters).
+   - Encryption: a repeating-key XOR (the simplest possible stream cipher)
+     with key "H0t3lSt@ff0NlyK3epS3cr3t!" so the payload is not plaintext.
+   - Placement: the blob rides along in the Cookie header of a normal-looking
+     HTTP GET -- traffic that "looks ordinary until you decode it".
+
+5. DECODING
+   For each request, in frame order:
+       cookie value (base64) -> bytes -> XOR with key -> one character.
+   Concatenating all 30 characters yields the flag.
+
+6. KEY TAKEAWAYS / DETECTION NOTES
+   - One HTTP request per keypress is a timing anomaly (a beacon).
+   - A User-Agent that matches no real product is a red flag.
+   - Data hidden in request headers (cookies) is easy to miss if you only
+     look at request bodies.
+   - Repeating-key XOR with a static key is trivially breakable once the
+     script is recovered.
+
+FLAG: THM{V3r4_1s_w4tch1ng_0veR_y0u}
+================================================================================

