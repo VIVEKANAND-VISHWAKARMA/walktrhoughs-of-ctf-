@@ -1,0 +1,61 @@
+========================================================
+Management Wants a Word — TryHackMe
+========================================================
+Flag: THM{1t_w4s_V3r4_A11_Al0ng?!}
+
+1. Secretsdump the hives, crack vera's hash with john -> minivera
+
+   impacket-secretsdump -sam SAM -system SYSTEM LOCAL
+   echo 'vera:$NT$1241186a4aac4f34f4bf7ace71b396a8' > nt.john
+   john --format=nt --wordlist=/usr/share/wordlists/rockyou.txt nt.john
+
+2. Unlock the DPAPI master key with that password, then unwrap
+   Chrome's key and read the saved login (bytelotus.thm:8080)
+
+   impacket-dpapi masterkey -file "Protect/SID/c90719ef-5b98-474e-b934-136d606a702a" \
+     -sid "S-1-5-21-2529683458-431225740-1723070931-1000" -password minivera
+
+   username : VeraSecretVault
+   password : Wh4t1sV3raD0inG0nTh1sH0st
+
+3. That password opens the VeraCrypt volume (Documents/backup).
+   Two ways to get the flag out of it.
+
+--------------------------------------------------------
+Method 1 — mount it (cryptsetup / VeraCrypt mode)
+--------------------------------------------------------
+
+   sudo cryptsetup open --type tcrypt --veracrypt "C/Users/vera/Documents/backup" veracontainer
+   sudo mkdir -p /mnt/veradata && sudo mount -o ro /dev/mapper/veracontainer /mnt/vera
+
+   Open secret_financial_documents/important_invoice_byte_lotus.pdf
+   -> flag is in the invoice.
+
+--------------------------------------------------------
+Method 2 — manual decrypt (no sudo, no mount tools)
+--------------------------------------------------------
+The container uses ABSOLUTE XTS data units (tweak = offset/512),
+not the usual relative ones, so standard offsets give garbage.
+
+   # header: salt[0:64] + encrypted header[64:512]
+   key  = PBKDF2-HMAC-SHA512(pass, salt, 500000, dklen=64)
+   hdr  = AES-XTS-decrypt(header, key)           # magic "VERA", CRC ok
+   mk   = hdr[192:256]                           # volume master key
+
+   # decrypt every sector, tweak = sector number = offset // 512
+   for off in range(0, len(backup), 512):
+       decrypt(XTS(mk, tweak=off//512), backup[off:off+512])
+
+   -> dec_abs.bin  (FAT32, boot sector at offset 131072 = unit 256)
+
+   7z l dec_abs.bin
+   7z x dec_abs.bin
+   -> secret_financial_documents/important_invoice_byte_lotus.pdf
+
+   # PDF is one image (636x724 RGB, FlateDecode)
+   python3 -m venv ocrvenv && ocrvenv/bin/pip install rapidocr-onnxruntime
+   -> OCR the image -> flag
+
+--------------------------------------------------------
+Flag: THM{1t_w4s_V3r4_A11_Al0ng?!}
+--------------------------------------------------------
