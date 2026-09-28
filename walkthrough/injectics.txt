@@ -1,0 +1,100 @@
+Injectics - Walkthrough
+=======================
+
+Target: Injectics (TryHackMe style web box)
+Goal: Locate the vulnerable login, bypass authentication, reach the admin panel, capture the flag, and gain a reverse shell.
+
+It started with a standard web app. The homepage was a sports leaderboard, and a quick look at the page source gave away a few useful clues. There was a comment left by the developer mentioning that emails were stored in a mail.log file, and navigation pointed to a login.php page. I began with a directory scan to map out the application and find the interesting endpoints.
+
+Reconnaissance
+--------------
+
+I ran a directory bruteforcer against the site to identify hidden paths. Along with the obvious index.php and login.php, the scan turned up a few names worth investigating:
+
+- /flags/ (directory listing was forbidden, but it existed)
+- /phpmyadmin/
+- /vendor/
+- /dashboard.php (redirected, so it required a session)
+- /adminLogin007.php (a hidden admin login page)
+- /functions.php (the backend API used by the login form)
+
+The functions.php endpoint was the most interesting. Looking at the login form, I saw that instead of posting directly to a page, it used JavaScript to send an AJAX request to functions.php with a function=login parameter. This was the real authentication handler.
+
+I also checked mail.log, which contained an internal email between the developer and an admin. The email described a service called "Injectics" that re-inserts default credentials into the users table every minute whenever the table is missing or corrupted. It listed two accounts:
+
+- superadmin@injectics.thm
+- dev@injectics.thm
+
+That gave me a strong hint about how the database was managed and about possible default accounts.
+
+Finding the Injection Point
+---------------------------
+
+The login form had a client-side filter. The JavaScript explicitly blocked a list of SQL keywords, including the words "or", "and", "union", "select", and the single and double quote characters. Typing any of these into the email field triggered an alert and stopped the request. That filter was only on the front end though, so I ignored it and sent requests straight to functions.php myself.
+
+When I tried to scan the parameter with a SQL injection tool, most requests came back with a HTTP 403 and a message about being blocked. It turned out the server was rejecting requests based on the user agent of the injection tool. Using a different user agent got past that check. Even so, a standard automated scan did not find anything on the username field.
+
+I started testing the password field manually with a time-based approach. Sending a payload with the word "OR" did nothing, but replacing it with the alternative syntax gave a clear delay. After a few tries I landed on a working payload:
+
+    x' || SLEEP(5) --
+
+This caused a noticeable delay in the response, which confirmed a time-based blind SQL injection in the password parameter. The interesting part was that the normal keywords for boolean logic were filtered, but the pipe-pipe operator was not, so I used that instead.
+
+Confirmation and Authentication Bypass
+--------------------------------------
+
+With a time-based blind injection confirmed, I could extract information one character at a time. The technique was to build a condition that stretched a query condition around a character comparison and watch for the delay. By comparing each character of the result against a candidate value and seeing whether the request took longer, I was able to read strings blindly.
+
+The first thing I pulled out was the name of the database, which turned out to be:
+
+    bacKjOsF
+
+That gave me a solid idea of the schema and confirmed I was looking at MySQL.
+
+Using the same injection, I was able to bypass the authentication check entirely. By making the where clause always true, the login accepted the request and set a session. The response came back as a successful login for the dev account, which redirected to a dashboard page.
+
+Reaching the Admin Panel and First Flag
+---------------------------------------
+
+Inside the dashboard I found a link to an administrator login page called adminLogin007.php. Through a combination of the authentication bypass and the knowledge that the database seeded default administrator credentials, I got access to the admin area.
+
+The admin dashboard showed a welcome message for the administrator account and displayed a flag directly on the page:
+
+    THM{INJECTICS_ADMIN_PANEL_007}
+
+That was the first flag.
+
+Second Flag and Server-Side Template Injection
+----------------------------------------------
+
+There was another objective, a hidden text file inside the flags folder. Browsing to /flags/ returned a forbidden error because directory listing was disabled, so I needed another way onto the server.
+
+Inside the admin dashboard there was a profile update page with editable fields for the first and last name. When those fields were saved, the server rendered them back into the page. That looked like a good place to test for template injection.
+
+I put a simple arithmetic expression into the name field to see whether it evaluated. It returned a result that did not look like a normal string, which told me the value was being run through a server-side template engine. Next I tried a payload that executes a system command using the passthru function, and the output was printed directly into the page. That confirmed remote command execution.
+
+The working style of payload looked like this:
+
+    {{['COMMAND',""]|sort('passthru')}}
+
+From there I could run arbitrary commands. I started by listing the contents of the flags folder to find the hidden text file, then read it directly to capture the second flag. Having command execution on the server made it straightforward to locate and read anything I needed.
+
+Reverse Shell
+-------------
+
+RCE alone was useful, but a proper shell made exploration much easier. I set up a listener on my machine and then used the same template injection to push a reverse shell back. I started a listener with netcat on a chosen port and then submitted a reverse shell command through the vulnerable field. As soon as the page processed the payload, the shell connected back and gave me an interactive session on the server.
+
+Summary
+-------
+
+The main vulnerability chain was:
+
+1. Directory enumeration revealed a backend API and a hidden admin login.
+2. A client-side keyword filter guarded the email field, but it was easily bypassed by talking to the API directly.
+3. A server-side user agent filter was also not much of a barrier once the user agent was changed.
+4. The password parameter on the login API was vulnerable to time-based blind SQL injection, using the pipe-pipe operator to avoid filtered words.
+5. That injection let me bypass authentication and ended up giving access to the admin dashboard and the first flag.
+6. A profile field was rendered through a server-side template engine, which allowed command injection using a passthru-based payload.
+7. Command execution gave me the second flag from the flags folder and a reverse shell back to my machine.
+
+The key lessons were to always look past client-side filtering, to test parameters that automated tools might skip, and to be ready to switch between injection and template execution once one path led to the next.
